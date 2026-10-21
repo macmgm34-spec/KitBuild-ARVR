@@ -7,10 +7,18 @@ bisa disambungkan menjadi proposisi `Konsep --[relasi]--> Konsep`.
 ## Fitur
 
 - Muat peta konsep dari file JSON (file picker Android), clipboard (JSON/URL), atau API
-- Sambungkan node: drag tombol → / ← ke node tujuan, atau tap tombol lalu tap node
-- Hapus semua koneksi sebuah relasi (tombol X)
+- Gesture mengikuti Kit-Build (kbx):
+  - Tap relasi → muncul handle kiri (merah, source) & kanan (biru, target), plus handle di
+    ujung tiap koneksi yang ada
+  - Drag handle kiri/kanan ke konsep untuk menyambung; saat melewati konsep garis *snap*
+    jadi putus-putus. Tap handle tidak melakukan apa-apa (sama seperti kbx)
+  - Drag handle koneksi: lepas di konsep lain = pindah koneksi, lepas di ruang kosong = putus
+  - Handle kiri hanya muncul bila relasi belum punya source; handle kanan hilang bila jumlah
+    target mencapai `limit`
+  - Double-tap node → pilih node + tetangganya, lalu drag untuk memindah semuanya
+  - Tap ruang kosong → lepas seleksi
 - Pindahkan node dengan drag, pinch untuk mengubah ukuran semua node
-- Undo / Redo
+- Undo / Redo: sambung, pindah/putus koneksi, pindah node, rapikan, pusatkan
 - Rapikan node ke grid, pusatkan peta ke depan kamera
 - Indikator tepi layar untuk node yang berada di luar pandangan
 - Simpan hasil ke `Download/ConceptMapAR/` (Android) atau `persistentDataPath`
@@ -83,12 +91,17 @@ Unity -batchmode -quit -projectPath . -buildTarget Android -executeMethod QuestS
 | Aksi                         | Controller                     | Tangan              |
 |------------------------------|--------------------------------|---------------------|
 | Pilih node / tekan tombol UI | Trigger                        | Pinch               |
-| Pindah node                  | Tahan trigger di node + arahkan | Tahan pinch + arahkan |
-| Sambungkan                   | Tahan trigger di → / ←, lepas di node tujuan | sama, pakai pinch |
-| Ubah ukuran semua node       | Thumbstick kanan atas/bawah    | –                   |
+| Pilih node + tetangga        | Trigger 2× cepat               | Pinch 2× cepat      |
+| Pindah node / seleksi        | Tahan trigger di node + arahkan | Tahan pinch + arahkan |
+| Sambungkan                   | Tahan trigger di handle kiri/kanan relasi, lepas di konsep | sama, pakai pinch |
+| Pindah / putus koneksi       | Tahan trigger di handle koneksi, lepas di konsep lain / ruang kosong | sama, pakai pinch |
+| Jauhkan / dekatkan node      | Saat drag: thumbstick ↑/↓ atau gerakkan controller maju/mundur | Saat drag: gerakkan tangan maju/mundur |
+| Ubah ukuran semua node       | Thumbstick kanan atas/bawah (saat tidak drag) | –         |
 | Pindahkan panel menu ke depan | Tombol ≡ (kiri) / B (kanan)   | –                   |
 
 Panel toolbar mengikuti kepala secara lembut; indikator tepi layar dimatikan di Quest.
+Controller tampil sebagai model sederhana (trigger menyala biru saat ditekan) dan
+disembunyikan otomatis saat memakai hand tracking.
 Izin *spatial data* (`USE_SCENE`) diminta saat pertama dibuka — izinkan agar node bisa
 ditaruh di permukaan meja/lantai.
 

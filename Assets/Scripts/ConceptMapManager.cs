@@ -51,10 +51,21 @@ public class ConceptMapManager : MonoBehaviour
     // Connection drag state
     private bool     isDragging;
     private MapNode  dragFromNode;
+    private MapNode  dragCandidate;   // konsep tempat garis preview "snap"
+    private int      dragPointerId;   // pointer (tangan) pemilik drag koneksi
+
+    // Tap di ruang kosong → lepas seleksi
+    private int           emptyTapId = int.MinValue;
+    private PointerSample emptyTapBegin;
     private LineRenderer previewLR;
+    private Material     previewSolidMat, previewDashedMat;
+    private GameObject   previewArrow, previewDot;   // ujung garis drag (▲ target / ● source)
+    private bool         dragSourceHandle;
     private static readonly List<ARRaycastHit> arHits = new();
 
     // Counter for new node IDs
+    private AppToolbar toolbar;
+
     private int cCounter = 0;
     private int lCounter = 0;
 
@@ -139,11 +150,18 @@ public class ConceptMapManager : MonoBehaviour
         previewLR.startWidth     = 0.008f;
         previewLR.endWidth       = 0.008f;
         previewLR.numCapVertices = 4;
-        previewLR.material       = new Material(Shader.Find("Sprites/Default"));
-        var green = new Color(0.42f, 0.76f, 0.58f, 0.95f);
-        previewLR.startColor = green;
-        previewLR.endColor   = green;
-        previewLR.enabled    = false;
+        previewLR.textureMode    = LineTextureMode.Tile;
+        previewLR.textureScale   = new Vector2(30f, 1f);   // ±3.3cm per segmen putus-putus
+        previewSolidMat  = new Material(Shader.Find("Sprites/Default"));
+        previewDashedMat = new Material(Shader.Find("Sprites/Default")) { mainTexture = MakeDashTexture() };
+        previewLR.sharedMaterial = previewSolidMat;
+        previewLR.enabled        = false;
+
+        // Ujung garis drag seperti VIRTUAL-EDGE kbx: segitiga (kanan) / lingkaran (kiri)
+        previewArrow = ConnectionLine.CreateArrowHead(previewLR.transform, Color.white);
+        previewDot   = ConnectionLine.CreateEndDot(previewLR.transform, Color.white);
+        previewArrow.SetActive(false);
+        previewDot.SetActive(false);
 
         // Sembunyikan visualisasi AR plane
         if (arPlanes != null)
@@ -180,13 +198,41 @@ public class ConceptMapManager : MonoBehaviour
     {
         UpdateTrackingStatus();
         HandlePlacementTap();
+        HandleEmptyTap();
         HandlePinchZoom();
+    }
+
+    void HandleEmptyTap()
+    {
+        if (currentMode != Mode.None) return;
+        foreach (var p in PointerInput.Samples)
+        {
+            if (p.phase == TouchPhase.Began)
+            {
+                bool onNode = Physics.Raycast(p.ray, out RaycastHit hit)
+                           && hit.transform.GetComponentInParent<MapNode>() != null;
+                if (!p.overUI && !onNode && !isDragging && !MapNode.GestureActive)
+                { emptyTapId = p.id; emptyTapBegin = p; }
+            }
+            else if (p.id == emptyTapId)
+            {
+                if (p.phase == TouchPhase.Moved && PointerInput.BeyondDragThreshold(emptyTapBegin, p))
+                    emptyTapId = int.MinValue;
+                else if (p.phase == TouchPhase.Ended)
+                {
+                    emptyTapId = int.MinValue;
+                    MapNode.DeselectAll();
+                }
+                else if (p.phase == TouchPhase.Canceled) emptyTapId = int.MinValue;
+            }
+        }
     }
 
     // ── Pinch to scale semua node ─────────────────
     void HandlePinchZoom()
     {
-        float axis = PointerInput.ScaleAxis;
+        // Saat menyeret node, thumbstick dipakai untuk menjauh/mendekat — bukan skala
+        float axis = MapNode.GestureActive ? 0f : PointerInput.ScaleAxis;
         if (Mathf.Abs(axis) > 0.2f)
         {
             nodeScale = Mathf.Clamp(nodeScale + axis * Time.deltaTime, MIN_SCALE, MAX_SCALE);
@@ -385,13 +431,22 @@ public class ConceptMapManager : MonoBehaviour
                 AddConnectionLine(lkNode.transform, tgtNode.transform, ConnectionLine.ConnectionType.Target);
             }
         }
+
+        // Badge sisa target di setiap relasi (drawLinkRemaining di kbx)
+        foreach (var kv in linkObjects)
+        {
+            int limit = GetLinkLimit(kv.Key);
+            kv.Value.SetRemaining(limit == int.MaxValue ? 0 : limit - TargetCount(kv.Key));
+        }
+
+        MapNode.RefreshSelectedHandles();
     }
 
     void AddConnectionLine(Transform from, Transform to, ConnectionLine.ConnectionType type)
     {
         var go  = Instantiate(connectionLinePrefab);
         var cl  = go.GetComponent<ConnectionLine>();
-        cl.Init(from, to, type);
+        cl.Init(from, to, type, IsBidirectional);
         connections.Add(cl);
     }
 
@@ -470,6 +525,7 @@ public class ConceptMapManager : MonoBehaviour
             };
             mapFile.canvas.links.Add(data);
             SpawnLink(data, worldPos);
+            DrawAllConnections();   // tampilkan badge sisa target relasi baru
             ShowStatus($"[OK] Relasi '{data.label}' ditambahkan");
         }
 
@@ -480,90 +536,157 @@ public class ConceptMapManager : MonoBehaviour
     // ─────────────────────────────────────────────
     //  DRAG-TO-CONNECT  (called by MapNode)
     // ─────────────────────────────────────────────
-    public void BeginConnectionDrag(MapNode fromNode, PointerSample pointer)
+    /// Peta bidirectional (map.direction "bi") → semua ujung koneksi berupa lingkaran
+    public bool IsBidirectional => mapFile?.map?.direction == "bi";
+
+    /// false bila pointer lain (tangan satunya) sedang menarik koneksi
+    public bool BeginConnectionDrag(MapNode fromNode, PointerSample pointer, bool sourceHandle)
     {
-        isDragging   = true;
-        dragFromNode = fromNode;
+        if (isDragging) return false;
+        isDragging       = true;
+        dragPointerId    = pointer.id;
+        dragFromNode     = fromNode;
+        dragCandidate    = null;
+        dragSourceHandle = sourceHandle;
 
-        // Highlight valid targets
-        if (fromNode is ConceptNode)
-            foreach (var kv in linkObjects)    kv.Value.SetHighlight(true);
-        else
-            foreach (var kv in conceptObjects) kv.Value.SetHighlight(true);
-
-        if (previewLR != null) previewLR.enabled = true;
-        ShowStatus(fromNode is ConceptNode
-            ? "Drag ke node Relasi untuk set source"
-            : "Drag ke node Konsep untuk set target");
+        // Warna garis = warna border handle (kbx: drawDragEdge)
+        Color c = sourceHandle ? MapNode.LEFT_BORDER : MapNode.RIGHT_BORDER;
+        if (previewLR != null)
+        {
+            previewLR.startColor = c;
+            previewLR.endColor   = c;
+            previewLR.enabled    = true;
+        }
+        previewArrow.GetComponent<MeshRenderer>().material.color = c;
+        previewDot  .GetComponent<MeshRenderer>().material.color = c;
+        UpdateConnectionDrag(pointer);
+        ShowStatus("Lepas di node Konsep untuk menyambung");
+        return true;
     }
 
     public void UpdateConnectionDrag(PointerSample pointer)
     {
-        if (!isDragging || previewLR == null) return;
+        if (!isDragging || pointer.id != dragPointerId || previewLR == null) return;
 
         Vector3 from = dragFromNode.transform.position;
 
-        // Proyeksikan jari ke bidang sejajar kamera di kedalaman node,
-        // supaya ujung garis selalu tepat di bawah jari
-        Plane p = new Plane(arCamera.transform.forward, from);
-        Ray   r = pointer.ray;
-        Vector3 to = p.Raycast(r, out float d)
-            ? r.GetPoint(d)
-            : r.origin + r.direction * 1.5f;
+        // Seperti kbx: saat melewati konsep, garis "snap" ke konsep itu
+        // (CANDIDATE edge putus-putus, VIRTUAL-EDGE disembunyikan)
+        dragCandidate = FindConceptAt(pointer);
 
+        Vector3 to;
+        if (dragCandidate != null) to = dragCandidate.transform.position;
+        else
+        {
+            // Proyeksikan jari ke bidang sejajar kamera di kedalaman node,
+            // supaya ujung garis selalu tepat di bawah jari
+            Plane p = new Plane(arCamera.transform.forward, from);
+            Ray   r = pointer.ray;
+            to = p.Raycast(r, out float d) ? r.GetPoint(d) : r.origin + r.direction * 1.5f;
+        }
+
+        Vector3 dir = (to - from).normalized;
+        from += dir * MapNode.BoundaryDistance(dragFromNode.transform, dir);
+        if (dragCandidate != null) to -= dir * MapNode.BoundaryDistance(dragCandidate.transform, -dir);
+
+        previewLR.sharedMaterial = dragCandidate != null ? previewDashedMat : previewSolidMat;
         previewLR.SetPosition(0, from);
         previewLR.SetPosition(1, to);
+
+        bool marker = dragCandidate == null;
+        bool dot    = dragSourceHandle || IsBidirectional;
+        previewArrow.SetActive(marker && !dot);
+        previewDot  .SetActive(marker && dot);
+        if (marker)
+        {
+            previewDot.transform.position   = to;
+            previewArrow.transform.position = to;
+            if (dir.sqrMagnitude > 1e-6f)
+                previewArrow.transform.rotation = Quaternion.LookRotation(dir, -arCamera.transform.forward);
+        }
     }
 
+    static Texture2D MakeDashTexture()
+    {
+        var tex = new Texture2D(8, 1, TextureFormat.RGBA32, false)
+        {
+            wrapMode   = TextureWrapMode.Repeat,
+            filterMode = FilterMode.Point,
+        };
+        for (int x = 0; x < 8; x++) tex.SetPixel(x, 0, x < 5 ? Color.white : Color.clear);
+        tex.Apply();
+        return tex;
+    }
+
+    public void CancelConnectionDrag()
+    {
+        isDragging    = false;
+        dragCandidate = null;
+        if (previewLR != null) previewLR.enabled = false;
+        if (previewArrow) previewArrow.SetActive(false);
+        if (previewDot)   previewDot.SetActive(false);
+    }
+
+    /// Drag handle kiri / kanan relasi dilepas: sambungkan source / target baru
     public void EndConnectionDrag(PointerSample pointer, MapNode fromNode, bool backward = false)
     {
-        if (!isDragging) return;
-        isDragging = false;
+        if (!isDragging || pointer.id != dragPointerId) return;
+        CancelConnectionDrag();
 
-        ClearHighlights();
-        if (previewLR != null) previewLR.enabled = false;
+        var target = FindConceptAt(pointer);
+        if (target == null) { ShowStatus("[!] Lepaskan di dekat node Konsep"); return; }
 
-        // 1) Raycast langsung ke node
-        MapNode target = null;
+        if (backward) TryConnect(target, fromNode);
+        else          TryConnect(fromNode, target);
+    }
+
+    /// Drag handle koneksi yang sudah ada dilepas: di konsep lain = pindah, di ruang kosong = putus
+    public void EndEdgeMove(PointerSample pointer, MapNode linkNode, EdgeRef edge)
+    {
+        if (!isDragging || pointer.id != dragPointerId) return;
+        CancelConnectionDrag();
+        if (edge == null) return;
+
+        var target = FindConceptAt(pointer);
+        if (target == null)               Disconnect(edge);
+        else if (target.NodeId != edge.ConceptId) MoveEdge(edge, target);
+    }
+
+    // Konsep di bawah pointer: raycast langsung, lalu sensing lebar
+    // (sudut kecil di XR, 10% tinggi layar di HP)
+    MapNode FindConceptAt(PointerSample pointer)
+    {
         Ray ray = pointer.ray;
         if (Physics.Raycast(ray, out RaycastHit hit, 10f))
         {
             var hitNode = hit.transform.GetComponentInParent<MapNode>();
-            if (hitNode != null && hitNode != fromNode) target = hitNode;
+            if (hitNode is ConceptNode) return hitNode;
         }
 
-        // 2) Sensing lebar: kalau raycast meleset, ambil node terdekat
-        //    dalam radius layar (10% tinggi layar) dari titik lepas
-        if (target == null && pointer.xr)
+        MapNode best = null;
+        if (pointer.xr)
         {
-            float best = XR_PICK_DEGREES;
-            foreach (var n in MapNode.All)
+            float bestA = XR_PICK_DEGREES;
+            foreach (var n in conceptObjects.Values)
             {
-                if (n == null || n == fromNode) continue;
+                if (n == null) continue;
                 float a = Vector3.Angle(ray.direction, n.transform.position - ray.origin);
-                if (a < best) { best = a; target = n; }
+                if (a < bestA) { bestA = a; best = n; }
             }
         }
-        else if (target == null)
+        else
         {
-            float best = Screen.height * 0.10f;
-            foreach (var n in MapNode.All)
+            float bestD = Screen.height * 0.10f;
+            foreach (var n in conceptObjects.Values)
             {
-                if (n == null || n == fromNode) continue;
+                if (n == null) continue;
                 Vector3 sp = arCamera.WorldToScreenPoint(n.transform.position);
                 if (sp.z < 0f) continue;
                 float d = Vector2.Distance((Vector2)sp, pointer.screenPos);
-                if (d < best) { best = d; target = n; }
+                if (d < bestD) { bestD = d; best = n; }
             }
         }
-
-        if (target != null)
-        {
-            // backward (tombol "←" LinkNode): node tujuan jadi SOURCE relasi
-            if (backward) TryConnect(target, fromNode);
-            else          TryConnect(fromNode, target);
-        }
-        else ShowStatus("[!] Lepaskan di dekat node tujuan");
+        return best;
     }
 
     public void TryConnect(MapNode from, MapNode to)
@@ -571,36 +694,37 @@ public class ConceptMapManager : MonoBehaviour
         // Concept → Link: set source
         if (from is ConceptNode cNode && to is LinkNode lNode)
         {
-            var lData = mapFile.canvas.links.Find(l => l.lid == lNode.NodeId);
-            if (lData != null)
-            {
-                string oldSource = lData.source_cid;
-                string newSource = cNode.NodeId;
-                lData.source_cid = newSource;
-                DrawAllConnections();
-                ShowStatus($"[OK] Source: {cNode.Label} → {lNode.Label}");
-                PushUndo($"source {cNode.Label} → {lNode.Label}",
-                    undo: () => { lData.source_cid = oldSource; DrawAllConnections(); },
-                    redo: () => { lData.source_cid = newSource; DrawAllConnections(); });
-            }
+            var lData = FindLink(lNode.NodeId);
+            if (lData == null) return;
+            if (IsTargetOf(lData.lid, cNode.NodeId))
+            { ShowStatus("[!] Source dan target tidak boleh sama"); return; }
+
+            string oldSource = lData.source_cid;
+            string newSource = cNode.NodeId;
+            lData.source_cid = newSource;
+            DrawAllConnections();
+            ShowStatus($"[OK] Source: {cNode.Label} → {lNode.Label}");
+            PushUndo($"source {cNode.Label} → {lNode.Label}",
+                undo: () => { lData.source_cid = oldSource; DrawAllConnections(); },
+                redo: () => { lData.source_cid = newSource; DrawAllConnections(); });
         }
         // Link → Concept: add target
         else if (from is LinkNode lNode2 && to is ConceptNode cNode2)
         {
-            var lData = mapFile.canvas.links.Find(l => l.lid == lNode2.NodeId);
+            var lData = FindLink(lNode2.NodeId);
             if (lData == null) return;
             if (lData.source_cid == cNode2.NodeId)
             { ShowStatus("[!] Source dan target tidak boleh sama"); return; }
-
-            bool exists = mapFile.canvas.linktargets
-                .Exists(t => t.lid == lNode2.NodeId && t.target_cid == cNode2.NodeId);
-            if (exists) { ShowStatus("[!] Target sudah terhubung"); return; }
+            if (IsTargetOf(lData.lid, cNode2.NodeId))
+            { ShowStatus("[!] Target sudah terhubung"); return; }
+            if (TargetCount(lData.lid) >= GetLinkLimit(lData.lid))
+            { ShowStatus("[!] Jumlah target relasi ini sudah maksimal"); return; }
 
             var newTarget = new LinkTargetData
             {
                 lid         = lNode2.NodeId,
                 target_cid  = cNode2.NodeId,
-                target_data = JsonConvert.SerializeObject(new { source = lNode2.NodeId, target = cNode2.NodeId, type = "right" })
+                target_data = TargetDataJson(lNode2.NodeId, cNode2.NodeId)
             };
             mapFile.canvas.linktargets.Add(newTarget);
             DrawAllConnections();
@@ -611,14 +735,220 @@ public class ConceptMapManager : MonoBehaviour
         }
         else
         {
-            ShowStatus("[!] Drag Konsep→Relasi atau Relasi→Konsep");
+            ShowStatus("[!] Sambungkan Konsep→Relasi atau Relasi→Konsep");
         }
     }
 
-    void ClearHighlights()
+    // ─────────────────────────────────────────────
+    //  EDGE (koneksi) — dipakai handle per koneksi
+    // ─────────────────────────────────────────────
+    public class EdgeRef
     {
-        foreach (var kv in conceptObjects) kv.Value.SetHighlight(false);
-        foreach (var kv in linkObjects)    kv.Value.SetHighlight(false);
+        public LinkData       link;
+        public LinkTargetData target;   // null = edge source
+        public bool   isSource  => target == null;
+        public string ConceptId => isSource ? link.source_cid : target.target_cid;
+    }
+
+    public List<EdgeRef> GetEdges(string lid)
+    {
+        var list  = new List<EdgeRef>();
+        var lData = FindLink(lid);
+        if (lData == null) return list;
+        if (!string.IsNullOrEmpty(lData.source_cid) && conceptObjects.ContainsKey(lData.source_cid))
+            list.Add(new EdgeRef { link = lData });
+        foreach (var lt in mapFile.canvas.linktargets)
+            if (lt.lid == lid && conceptObjects.ContainsKey(lt.target_cid))
+                list.Add(new EdgeRef { link = lData, target = lt });
+        return list;
+    }
+
+    public MapNode GetNode(string id)
+    {
+        if (id == null) return null;
+        if (conceptObjects.TryGetValue(id, out var c)) return c;
+        if (linkObjects.TryGetValue(id, out var l))    return l;
+        return null;
+    }
+
+    /// Batas jumlah target relasi (field "limit" di data). Tanpa limit = tak terbatas.
+    public int GetLinkLimit(string lid)
+    {
+        var lData = FindLink(lid);
+        return lData?.Visual.limit ?? int.MaxValue;
+    }
+
+    LinkData FindLink(string lid) => mapFile?.canvas.links.Find(l => l.lid == lid);
+
+    bool IsTargetOf(string lid, string cid) =>
+        mapFile.canvas.linktargets.Exists(t => t.lid == lid && t.target_cid == cid);
+
+    int TargetCount(string lid) =>
+        mapFile.canvas.linktargets.FindAll(t => t.lid == lid).Count;
+
+    static string TargetDataJson(string lid, string cid) =>
+        JsonConvert.SerializeObject(new { source = lid, target = cid, type = "right" });
+
+    string LabelOf(string id) => GetNode(id)?.Label ?? id;
+
+    /// Pindahkan ujung konsep sebuah koneksi ke konsep lain (move-connect di kbx)
+    void MoveEdge(EdgeRef e, MapNode concept)
+    {
+        var    lData  = e.link;
+        string newCid = concept.NodeId;
+        string oldCid = e.ConceptId;
+
+        if (e.isSource)
+        {
+            if (IsTargetOf(lData.lid, newCid))
+            { ShowStatus("[!] Source dan target tidak boleh sama"); return; }
+            lData.source_cid = newCid;
+            DrawAllConnections();
+            PushUndo($"pindah source {LabelOf(lData.lid)} ke {concept.Label}",
+                undo: () => { lData.source_cid = oldCid; DrawAllConnections(); },
+                redo: () => { lData.source_cid = newCid; DrawAllConnections(); });
+        }
+        else
+        {
+            if (lData.source_cid == newCid)
+            { ShowStatus("[!] Source dan target tidak boleh sama"); return; }
+            if (IsTargetOf(lData.lid, newCid))
+            { ShowStatus("[!] Target sudah terhubung"); return; }
+
+            var    lt      = e.target;
+            string oldData = lt.target_data;
+            string newData = TargetDataJson(lData.lid, newCid);
+            lt.target_cid  = newCid; lt.target_data = newData;
+            DrawAllConnections();
+            PushUndo($"pindah target {LabelOf(lData.lid)} ke {concept.Label}",
+                undo: () => { lt.target_cid = oldCid; lt.target_data = oldData; DrawAllConnections(); },
+                redo: () => { lt.target_cid = newCid; lt.target_data = newData; DrawAllConnections(); });
+        }
+        ShowStatus($"[OK] Koneksi {LabelOf(lData.lid)} dipindah ke {concept.Label}");
+    }
+
+    /// Putus satu koneksi (disconnect di kbx)
+    void Disconnect(EdgeRef e)
+    {
+        var    lData = e.link;
+        string desc  = $"putus {LabelOf(lData.lid)} – {LabelOf(e.ConceptId)}";
+
+        if (e.isSource)
+        {
+            string oldCid = lData.source_cid;
+            lData.source_cid = null;
+            DrawAllConnections();
+            PushUndo(desc,
+                undo: () => { lData.source_cid = oldCid; DrawAllConnections(); },
+                redo: () => { lData.source_cid = null;   DrawAllConnections(); });
+        }
+        else
+        {
+            var lt    = e.target;
+            int index = mapFile.canvas.linktargets.IndexOf(lt);
+            mapFile.canvas.linktargets.Remove(lt);
+            DrawAllConnections();
+            PushUndo(desc,
+                undo: () => {
+                    var list = mapFile.canvas.linktargets;
+                    list.Insert(Mathf.Clamp(index, 0, list.Count), lt);
+                    DrawAllConnections();
+                },
+                redo: () => { mapFile.canvas.linktargets.Remove(lt); DrawAllConnections(); });
+        }
+        ShowStatus($"[OK] {desc}");
+    }
+
+    // ─────────────────────────────────────────────
+    //  SELEKSI & PINDAH NODE
+    // ─────────────────────────────────────────────
+    /// Double-tap: pilih node + tetangganya (seperti dbltap di kbx)
+    public void SelectNeighborhood(MapNode node)
+    {
+        var group = new List<MapNode> { node };
+        var canvas = mapFile.canvas;
+
+        if (node is LinkNode)
+        {
+            var lData = FindLink(node.NodeId);
+            if (lData != null) group.Add(GetNode(lData.source_cid));
+            foreach (var lt in canvas.linktargets)
+                if (lt.lid == node.NodeId) group.Add(GetNode(lt.target_cid));
+        }
+        else
+        {
+            foreach (var l in canvas.links)
+                if (l.source_cid == node.NodeId) group.Add(GetNode(l.lid));
+            foreach (var lt in canvas.linktargets)
+                if (lt.target_cid == node.NodeId) group.Add(GetNode(lt.lid));
+        }
+
+        group.RemoveAll(n => n == null);
+        MapNode.SelectGroup(group);
+        ShowStatus($"{group.Count} node dipilih — drag salah satu untuk memindah semua");
+    }
+
+    /// Tool centroid (kbx): pindahkan relasi ke titik tengah konsep-konsep yang tersambung
+    public void CentroidLink(MapNode link)
+    {
+        var concepts = new List<MapNode>();
+        foreach (var e in GetEdges(link.NodeId))
+        {
+            var c = GetNode(e.ConceptId);
+            if (c != null && !concepts.Contains(c)) concepts.Add(c);
+        }
+        if (concepts.Count == 0) return;
+
+        Vector3 to = Vector3.zero;
+        foreach (var c in concepts) to += c.transform.position;
+        to /= concepts.Count;
+
+        Vector3 from = link.transform.position;
+        var before = new List<(MapNode, Vector3)> { (link, from) };
+        var after  = new List<(MapNode, Vector3)> { (link, to) };
+        PushUndo($"centroid {link.Label}", undo: () => ApplyPositions(before), redo: () => ApplyPositions(after));
+        StartCoroutine(AnimateMove(link.transform, from, to, 0.3f));
+        ShowStatus($"[OK] {link.Label} dipindah ke tengah konsepnya");
+    }
+
+    static IEnumerator AnimateMove(Transform t, Vector3 from, Vector3 to, float duration)
+    {
+        for (float e = 0f; e < duration && t != null; e += Time.deltaTime)
+        {
+            t.position = Vector3.Lerp(from, to, Mathf.SmoothStep(0f, 1f, e / duration));
+            yield return null;
+        }
+        if (t != null) t.position = to;
+    }
+
+    /// Dipanggil MapNode setelah drag selesai → masuk undo
+    public void CommitMove(List<(MapNode n, Vector3 from)> moved)
+    {
+        var before = new List<(MapNode, Vector3)>(moved);
+        var after  = new List<(MapNode, Vector3)>();
+        foreach (var (n, _) in moved) if (n) after.Add((n, n.transform.position));
+        if (after.Count == 0) return;
+
+        string desc = after.Count == 1 ? $"pindah {after[0].Item1.Label}" : $"pindah {after.Count} node";
+        PushUndo(desc, undo: () => ApplyPositions(before), redo: () => ApplyPositions(after));
+    }
+
+    static List<(MapNode, Vector3)> RecordPositions()
+    {
+        var list = new List<(MapNode, Vector3)>();
+        foreach (var n in MapNode.All) if (n) list.Add((n, n.transform.position));
+        return list;
+    }
+
+    void PushPositionUndo(string desc, List<(MapNode, Vector3)> before)
+    {
+        var after = RecordPositions();
+        PushUndo(desc, undo: () => ApplyPositions(before), redo: () => ApplyPositions(after));
+    }
+
+    static void ApplyPositions(List<(MapNode, Vector3)> positions)
+    {
+        foreach (var (n, pos) in positions) if (n) n.transform.position = pos;
     }
 
     // ─────────────────────────────────────────────
@@ -632,6 +962,7 @@ public class ConceptMapManager : MonoBehaviour
         var nodes = new List<MapNode>();
         foreach (var n in MapNode.All) if (n != null) nodes.Add(n);
         if (nodes.Count == 0) return;
+        var before = RecordPositions();
 
         GetViewBasis(out Vector3 camPos, out Vector3 fwd, out Vector3 right, out Vector3 up);
 
@@ -672,6 +1003,7 @@ public class ConceptMapManager : MonoBehaviour
             n.transform.position = origin + right * (fx * cellW) + up * (fy * cellH);
         }
 
+        PushPositionUndo("rapikan layout", before);
         ShowStatus("[OK] Layout dirapikan");
     }
 
@@ -683,6 +1015,7 @@ public class ConceptMapManager : MonoBehaviour
         var nodes = new List<MapNode>();
         foreach (var n in MapNode.All) if (n != null) nodes.Add(n);
         if (nodes.Count == 0) return;
+        var before = RecordPositions();
 
         // Pusat grup saat ini
         Vector3 centroid = Vector3.zero;
@@ -704,6 +1037,7 @@ public class ConceptMapManager : MonoBehaviour
         foreach (var (n, x, y) in offsets)
             n.transform.position = newCenter + right * x + up * y;
 
+        PushPositionUndo("pusatkan peta", before);
         ShowStatus("[OK] Peta dipusatkan ke depan kamera");
     }
 
@@ -736,38 +1070,6 @@ public class ConceptMapManager : MonoBehaviour
                     if (!used.Contains((gx + dx, gy + dy))) return (gx + dx, gy + dy);
                 }
         return (gx, gy); // penuh — biarkan (tidak mungkin dalam praktik)
-    }
-
-    // ─────────────────────────────────────────────
-    //  CLEAR LINK CONNECTIONS (dipanggil dari ✕ button)
-    // ─────────────────────────────────────────────
-    public void ClearLinkConnections(string lid)
-    {
-        var lData = mapFile?.canvas.links.Find(l => l.lid == lid);
-        if (lData == null) return;
-
-        string oldSource   = lData.source_cid;
-        var    oldTargets  = mapFile.canvas.linktargets.FindAll(lt => lt.lid == lid);
-
-        lData.source_cid = null;
-        mapFile.canvas.linktargets.RemoveAll(lt => lt.lid == lid);
-
-        DrawAllConnections();
-
-        var lNode = linkObjects.ContainsKey(lid) ? linkObjects[lid] : null;
-        string lbl = lNode != null ? lNode.Label : lid;
-        ShowStatus($"[OK] Semua koneksi '{lbl}' dihapus");
-        PushUndo($"hapus koneksi {lbl}",
-            undo: () => {
-                lData.source_cid = oldSource;
-                mapFile.canvas.linktargets.AddRange(oldTargets);
-                DrawAllConnections();
-            },
-            redo: () => {
-                lData.source_cid = null;
-                mapFile.canvas.linktargets.RemoveAll(lt => lt.lid == lid);
-                DrawAllConnections();
-            });
     }
 
     // ─────────────────────────────────────────────
@@ -822,11 +1124,14 @@ public class ConceptMapManager : MonoBehaviour
             mapFile.canvas.linktargets.Clear();
         }
         cCounter = 0; lCounter = 0;
+        undoStack.Clear(); redoStack.Clear();
         ShowStatus("Reset selesai");
     }
 
     void ClearScene()
     {
+        MapNode.DeselectAll();
+        CancelConnectionDrag();
         foreach (var kv in conceptObjects) if (kv.Value) Destroy(kv.Value.gameObject);
         foreach (var kv in linkObjects)    if (kv.Value) Destroy(kv.Value.gameObject);
         connections.ForEach(c => { if (c) Destroy(c.gameObject); });
@@ -840,8 +1145,14 @@ public class ConceptMapManager : MonoBehaviour
     // ─────────────────────────────────────────────
     public void ShowStatus(string msg)
     {
-        // Canvas dijaga bersih — status hanya ke log (untuk debugging)
+        // Canvas dijaga bersih — status hanya ke log (untuk debugging).
+        // Di VR tidak ada log yang terlihat → peringatan "[!]" tampil sebagai toast.
         Debug.Log($"[Status] {msg}");
+        if (PointerInput.IsXR && msg.StartsWith("[!]"))
+        {
+            if (toolbar == null) toolbar = FindFirstObjectByType<AppToolbar>();
+            if (toolbar != null) toolbar.ShowToast(msg.Substring(3).Trim(), 2.5f);
+        }
         if (statusText != null && statusText.gameObject.activeSelf)
             statusText.gameObject.SetActive(false);
     }

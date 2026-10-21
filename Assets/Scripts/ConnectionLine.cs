@@ -3,7 +3,9 @@ using UnityEngine;
 /// <summary>
 /// Renders one directed connection between two nodes using a LineRenderer.
 /// Source edge (concept→link): gray line + dot at the concept end.
-/// Target edge (link→concept): gray line + arrowhead at the concept end.
+/// Target edge (link→concept): gray line + arrowhead at the concept end
+/// (dot bila peta bidirectional, seperti edge.bi di kbx).
+/// Garis berhenti di tepi kotak node, bukan di pusatnya.
 /// </summary>
 [RequireComponent(typeof(LineRenderer))]
 public class ConnectionLine : MonoBehaviour
@@ -37,7 +39,7 @@ public class ConnectionLine : MonoBehaviour
         lr.numCornerVertices = 4;
     }
 
-    public void Init(Transform fromT, Transform toT, ConnectionType type)
+    public void Init(Transform fromT, Transform toT, ConnectionType type, bool bidirectional = false)
     {
         from     = fromT;
         to       = toT;
@@ -49,32 +51,38 @@ public class ConnectionLine : MonoBehaviour
         lr.startWidth = 0.004f;
         lr.endWidth   = 0.004f;
 
-        if (type == ConnectionType.Target)
+        if (type == ConnectionType.Target && !bidirectional)
         {
             arrowHead = arrowHeadPrefab != null
                 ? Instantiate(arrowHeadPrefab, transform)
-                : CreateArrowHead(c);
+                : CreateArrowHead(transform, c);
         }
         else
         {
-            // Source: titik bulat abu-abu di ujung concept (versi web)
-            endDot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            endDot.name = "EndDot";
-            endDot.transform.SetParent(transform, false);
-            endDot.transform.localScale = Vector3.one * 0.018f;
-            Destroy(endDot.GetComponent<Collider>());   // jangan ganggu raycast tap
-            var mr = endDot.GetComponent<MeshRenderer>();
-            mr.material = CreateSolidMaterial(c);
+            // Source (atau bidirectional): titik bulat di ujung concept (versi web)
+            endDot = CreateEndDot(transform, c);
         }
 
         lr.material = CreateSolidMaterial(c);
     }
 
-    // Panah segitiga sederhana (dipakai jika prefab tidak di-assign)
-    GameObject CreateArrowHead(Color c)
+    /// Titik bulat ujung koneksi (juga dipakai garis preview drag)
+    public static GameObject CreateEndDot(Transform parent, Color c)
+    {
+        var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        dot.name = "EndDot";
+        dot.transform.SetParent(parent, false);
+        dot.transform.localScale = Vector3.one * 0.018f;
+        Destroy(dot.GetComponent<Collider>());   // jangan ganggu raycast tap
+        dot.GetComponent<MeshRenderer>().material = CreateSolidMaterial(c);
+        return dot;
+    }
+
+    /// Panah segitiga sederhana (dipakai jika prefab tidak di-assign, dan untuk preview drag)
+    public static GameObject CreateArrowHead(Transform parent, Color c)
     {
         var go = new GameObject("ArrowHead");
-        go.transform.SetParent(transform, false);
+        go.transform.SetParent(parent, false);
 
         var mesh = new Mesh();
         // Segitiga menghadap +Z (arah garis), lebar 2.2cm panjang 3.5cm
@@ -99,10 +107,10 @@ public class ConnectionLine : MonoBehaviour
         Vector3 a = from.position;
         Vector3 b = to.position;
 
-        // Slightly offset so lines don't overlap node centers
+        // Potong garis di tepi kotak kedua node (target-distance-from-node di kbx)
         Vector3 dir = (b - a).normalized;
-        a += dir * 0.06f;
-        b -= dir * 0.06f;
+        a += dir * MapNode.BoundaryDistance(from,  dir);
+        b -= dir * MapNode.BoundaryDistance(to,   -dir);
 
         lr.SetPosition(0, a);
         lr.SetPosition(1, b);
@@ -117,11 +125,11 @@ public class ConnectionLine : MonoBehaviour
 
         // Titik bulat di ujung concept (koneksi source)
         if (endDot != null)
-            endDot.transform.position = a;
+            endDot.transform.position = connType == ConnectionType.Source ? a : b;
     }
 
     // ── Material helpers ──────────────────────────
-    static Material CreateSolidMaterial(Color c)
+    public static Material CreateSolidMaterial(Color c)
     {
         var mat = new Material(Shader.Find("Sprites/Default"));
         mat.color = c;

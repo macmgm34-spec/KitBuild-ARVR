@@ -88,5 +88,5 @@ public class NodeVisualData
     public float  width            = 70;
     public float  height           = 22;
     public string type             = "concept";
-    public int    limit            = 9;
+    public int?   limit;            // null = tanpa batas target
 }

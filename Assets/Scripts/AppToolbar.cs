@@ -502,7 +502,7 @@ public class AppToolbar : MonoBehaviour
         toastGO.SetActive(false);
     }
 
-    void ShowToast(string msg, float duration = 3f)
+    public void ShowToast(string msg, float duration = 3f)
     {
         toastTxt.text = msg;
         toastGO.SetActive(true);
