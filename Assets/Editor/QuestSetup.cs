@@ -24,6 +24,7 @@ public static class QuestSetup
     static readonly HashSet<string> QuestFeatures = new()
     {
         "MetaQuestFeature",
+        "OpenXRCompositionLayersFeature",   // wajib: layer passthrough dibuat lewat composition layer
         "MetaQuestTouchPlusControllerProfile",
         "OculusTouchControllerProfile",
         "HandInteractionProfile",
@@ -71,6 +72,7 @@ public static class QuestSetup
     // Fitur OpenXR untuk Play Mode di Editor (Standalone). MetaQuestFeature khusus Android.
     static readonly HashSet<string> SimulatorFeatures = new()
     {
+        "OpenXRCompositionLayersFeature",
         "MetaQuestTouchPlusControllerProfile",
         "OculusTouchControllerProfile",
         "HandInteractionProfile",
@@ -213,6 +215,9 @@ class QuestManifestPostprocessor : IPostGenerateGradleAndroidProject
         AddElement(doc, root, "uses-permission", "com.oculus.permission.HAND_TRACKING", null);
         AddElement(doc, root, "uses-permission", "com.oculus.permission.USE_SCENE", null);
         AddElement(doc, root, "uses-feature", "oculus.software.handtracking", "false");
+        // Scan QR soal: kamera passthrough (Horizon OS v74+) + keyboard sistem untuk "Ketik Link"
+        AddElement(doc, root, "uses-permission", "horizonos.permission.HEADSET_CAMERA", null);
+        AddElement(doc, root, "uses-feature", "oculus.software.overlay_keyboard", "false");
 
         doc.Save(manifestPath);
     }

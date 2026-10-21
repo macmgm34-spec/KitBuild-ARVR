@@ -74,6 +74,14 @@ public class XRSupport : MonoBehaviour
 
     public bool HeadTracked => cam != null && cam.transform.localPosition.sqrMagnitude > 0f;
 
+    /// Latar polos saat passthrough mati (default saat mengerjakan peta)
+    static readonly Color XR_BACKGROUND = Color.black;
+
+    /// Passthrough (dunia nyata) hanya dinyalakan saat perlu, mis. scan QR soal.
+    /// Di Quest passthrough mengikuti ARCameraManager.enabled; latar kamera harus
+    /// transparan saat ON dan polos saat OFF.
+    public bool Passthrough { get; set; }
+
     bool EnsureRunning()
     {
         if (running) return true;
@@ -103,7 +111,8 @@ public class XRSupport : MonoBehaviour
     void Update()
     {
         if (!EnsureRunning()) return;
-        if (cam == null) { cam = Camera.main; ConfigureCamera(); }
+        if (cam == null) cam = Camera.main;
+        ConfigureCamera();   // tiap frame: latar & passthrough mengikuti state Passthrough
 
         ScanCanvases();
         if (recenterAction.WasPressedThisFrame()) panelPlaced = false;
@@ -127,10 +136,16 @@ public class XRSupport : MonoBehaviour
     void ConfigureCamera()
     {
         if (cam == null) return;
+
+        var manager = cam.GetComponent<ARCameraManager>();
+        if (manager != null && manager.enabled != Passthrough) manager.enabled = Passthrough;
+
+        Color target = Passthrough ? new Color(0f, 0f, 0f, 0f) : XR_BACKGROUND;
+        if (cam.clearFlags == CameraClearFlags.SolidColor && cam.backgroundColor == target) return;
         var bg = cam.GetComponent<ARCameraBackground>();
         if (bg != null) bg.enabled = false;
         cam.clearFlags      = CameraClearFlags.SolidColor;
-        cam.backgroundColor = new Color(0f, 0f, 0f, 0f);
+        cam.backgroundColor = target;
         cam.nearClipPlane   = 0.05f;
     }
 

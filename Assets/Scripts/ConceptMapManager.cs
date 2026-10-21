@@ -124,7 +124,7 @@ public class ConceptMapManager : MonoBehaviour
         // Background putih polos — matikan passthrough kamera AR (spt versi web).
         // AR plane detection & tracking tetap jalan di belakang layar, hanya
         // gambar kamera yang tak dirender.
-        if (arCamera != null)
+        if (arCamera != null && !PointerInput.IsXR)   // VR: latar diatur XRSupport (transparan)
         {
             var camBg = arCamera.GetComponent<ARCameraBackground>();
             if (camBg != null) camBg.enabled = false;
@@ -418,7 +418,7 @@ public class ConceptMapManager : MonoBehaviour
                 && conceptObjects.TryGetValue(lk.source_cid, out var srcNode)
                 && linkObjects.TryGetValue(lk.lid, out var lkNode))
             {
-                AddConnectionLine(srcNode.transform, lkNode.transform, ConnectionLine.ConnectionType.Source);
+                AddConnectionLine(srcNode.transform, lkNode.transform, ConnectionLine.ConnectionType.Source, lk.lid, lk.source_cid);
             }
         }
 
@@ -428,7 +428,7 @@ public class ConceptMapManager : MonoBehaviour
             if (linkObjects.TryGetValue(lt.lid, out var lkNode)
                 && conceptObjects.TryGetValue(lt.target_cid, out var tgtNode))
             {
-                AddConnectionLine(lkNode.transform, tgtNode.transform, ConnectionLine.ConnectionType.Target);
+                AddConnectionLine(lkNode.transform, tgtNode.transform, ConnectionLine.ConnectionType.Target, lt.lid, lt.target_cid);
             }
         }
 
@@ -442,11 +442,13 @@ public class ConceptMapManager : MonoBehaviour
         MapNode.RefreshSelectedHandles();
     }
 
-    void AddConnectionLine(Transform from, Transform to, ConnectionLine.ConnectionType type)
+    void AddConnectionLine(Transform from, Transform to, ConnectionLine.ConnectionType type, string lid, string cid)
     {
         var go  = Instantiate(connectionLinePrefab);
         var cl  = go.GetComponent<ConnectionLine>();
         cl.Init(from, to, type, IsBidirectional);
+        cl.Lid       = lid;
+        cl.ConceptId = cid;
         connections.Add(cl);
     }
 
@@ -1071,6 +1073,90 @@ public class ConceptMapManager : MonoBehaviour
                 }
         return (gx, gy); // penuh — biarkan (tidak mungkin dalam praktik)
     }
+
+    // ─────────────────────────────────────────────
+    //  PENILAIAN OTOMATIS (Analyzer Kit-Build)
+    // ─────────────────────────────────────────────
+    public class AssessmentResult
+    {
+        public int   match, miss, excess, total;
+        public float Score => total > 0 ? (float)match / total : 0f;
+    }
+
+    // Warna compare map kbx: match hijau, excess biru
+    static readonly Color MATCH_COLOR  = new Color32(0x3A, 0xB7, 0x95, 0xFF);
+    static readonly Color EXCESS_COLOR = new Color32(0x5B, 0xC0, 0xEB, 0xFF);
+
+    public bool HasAnswerKey => mapFile?.meta?.kunci_jawaban != null && mapFile.meta.kunci_jawaban.Count > 0;
+
+    /// Bandingkan proposisi siswa dengan kunci_jawaban; warnai garis match/excess.
+    /// Proposisi yang kurang (miss) hanya dihitung, tidak ditampilkan. Null bila tanpa kunci.
+    public AssessmentResult Assess()
+    {
+        if (!HasAnswerKey) return null;
+
+        var key     = new HashSet<string>();
+        var example = new HashSet<string>();
+        foreach (var k in mapFile.meta.kunci_jawaban)
+            if (ParseProposition(k) is string p) key.Add(p);
+        if (ParseProposition(mapFile.meta.proposisi_contoh) is string ex && !key.Contains(ex)) example.Add(ex);
+
+        var concepts = new Dictionary<string, string>();
+        foreach (var c in mapFile.canvas.concepts) concepts[c.cid] = c.label;
+
+        // Status tiap koneksi target (lid|cid) → match / excess / contoh
+        var targetState = new Dictionary<string, Color>();
+        var linkState   = new Dictionary<string, Color>();
+        var found       = new HashSet<string>();
+        var result      = new AssessmentResult { total = key.Count };
+
+        foreach (var lt in mapFile.canvas.linktargets)
+        {
+            var link = FindLink(lt.lid);
+            if (link == null || string.IsNullOrEmpty(link.source_cid)) continue;
+            if (!concepts.TryGetValue(link.source_cid, out var src) || !concepts.TryGetValue(lt.target_cid, out var tgt)) continue;
+
+            string prop = PropKey(src, link.label, tgt);
+            string alt  = IsBidirectional ? PropKey(tgt, link.label, src) : null;
+            string hit  = key.Contains(prop) ? prop : alt != null && key.Contains(alt) ? alt : null;
+
+            Color color;
+            if (hit != null)                                         { color = MATCH_COLOR; found.Add(hit); }
+            else if (example.Contains(prop) || (alt != null && example.Contains(alt))) color = MATCH_COLOR;
+            else                                                     { color = EXCESS_COLOR; result.excess++; }
+
+            targetState[lt.lid + "|" + lt.target_cid] = color;
+            // Source relasi hijau bila ada satu proposisinya yang benar
+            if (!linkState.TryGetValue(lt.lid, out var prev) || prev != MATCH_COLOR) linkState[lt.lid] = color;
+        }
+
+        result.match = found.Count;
+        result.miss  = key.Count - found.Count;
+
+        foreach (var cl in connections)
+        {
+            if (cl == null) continue;
+            var  states = cl.Type == ConnectionLine.ConnectionType.Source ? linkState : targetState;
+            string id   = cl.Type == ConnectionLine.ConnectionType.Source ? cl.Lid : cl.Lid + "|" + cl.ConceptId;
+            if (states.TryGetValue(id, out var c)) cl.SetColor(c);   // koneksi tanpa proposisi utuh tetap abu-abu
+        }
+
+        ShowStatus($"[Nilai] benar {result.match}/{result.total}, kurang {result.miss}, lebih {result.excess}");
+        return result;
+    }
+
+    // "Beowulf --[is]--> Germanic Epic  (catatan)" → kunci ternormalisasi
+    static string ParseProposition(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var m = System.Text.RegularExpressions.Regex.Match(text, @"^\s*(.+?)\s*--\[(.+?)\]-->\s*(.+?)\s*(\(.*\))?\s*$");
+        return m.Success ? PropKey(m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value) : null;
+    }
+
+    static string PropKey(string s, string l, string t) => $"{Norm(s)}|{Norm(l)}|{Norm(t)}";
+
+    static string Norm(string s) =>
+        System.Text.RegularExpressions.Regex.Replace((s ?? "").Trim().ToLowerInvariant(), @"\s+", " ");
 
     // ─────────────────────────────────────────────
     //  SAVE

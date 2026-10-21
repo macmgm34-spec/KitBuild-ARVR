@@ -17,10 +17,14 @@ public class ConnectionLine : MonoBehaviour
     static readonly Color SOURCE_COLOR = new Color(0.58f, 0.58f, 0.6f, 0.95f);
     static readonly Color TARGET_COLOR = new Color(0.45f, 0.45f, 0.47f, 0.95f);
 
+    [HideInInspector] public string Lid;         // relasi pemilik koneksi
+    [HideInInspector] public string ConceptId;   // konsep di ujung koneksi
+
     private LineRenderer    lr;
     private Transform       from;
     private Transform       to;
     private ConnectionType  connType;
+    public  ConnectionType  Type => connType;
 
     // Arrow head (Target connections only)
     [SerializeField] private GameObject arrowHeadPrefab;
@@ -98,6 +102,16 @@ public class ConnectionLine : MonoBehaviour
         var mr = go.AddComponent<MeshRenderer>();
         mr.material = CreateSolidMaterial(c);
         return go;
+    }
+
+    /// Warna feedback penilaian (match/excess); garis dibuat ulang = warna default lagi
+    public void SetColor(Color c)
+    {
+        lr.startColor = c;
+        lr.endColor   = c;
+        lr.material.color = c;
+        if (arrowHead != null) foreach (var r in arrowHead.GetComponentsInChildren<Renderer>()) r.material.color = c;
+        if (endDot    != null) endDot.GetComponent<Renderer>().material.color = c;
     }
 
     void Update()

@@ -1,0 +1,80 @@
+{
+  "canvas": {
+    "concepts": [
+      {
+        "cid": "c1", "cmid": null, "label": "Tsunami",
+        "x": 640, "y": 200,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#FFBF40\",\"width\":70,\"height\":22,\"type\":\"concept\"}"
+      },
+      {
+        "cid": "c2", "cmid": null, "label": "Gempa Bumi",
+        "x": 280, "y": 130,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#FFBF40\",\"width\":85,\"height\":22,\"type\":\"concept\"}"
+      },
+      {
+        "cid": "c3", "cmid": null, "label": "Subduksi Lempeng",
+        "x": 960, "y": 130,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#FFBF40\",\"width\":120,\"height\":22,\"type\":\"concept\"}"
+      },
+      {
+        "cid": "c4", "cmid": null, "label": "Gelombang Laut",
+        "x": 280, "y": 460,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#FFBF40\",\"width\":110,\"height\":22,\"type\":\"concept\"}"
+      },
+      {
+        "cid": "c5", "cmid": null, "label": "Kerusakan",
+        "x": 640, "y": 560,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#FFBF40\",\"width\":75,\"height\":22,\"type\":\"concept\"}"
+      },
+      {
+        "cid": "c6", "cmid": null, "label": "Evakuasi",
+        "x": 960, "y": 460,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#FFBF40\",\"width\":70,\"height\":22,\"type\":\"concept\"}"
+      }
+    ],
+    "links": [
+      {
+        "lid": "l1", "cmid": null, "label": "disebabkan oleh",
+        "x": 430, "y": 165,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#DEDEDE\",\"width\":110,\"height\":22,\"type\":\"link\",\"limit\":9}",
+        "source_cid": "c1", "source_cmid": null,
+        "source_data": "{\"source\":\"l1\",\"target\":\"c1\",\"type\":\"left\"}"
+      },
+      {
+        "lid": "l2", "cmid": null, "label": "menghasilkan",
+        "x": 430, "y": 340,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#DEDEDE\",\"width\":95,\"height\":22,\"type\":\"link\",\"limit\":9}",
+        "source_cid": "c1", "source_cmid": null,
+        "source_data": "{\"source\":\"l2\",\"target\":\"c1\",\"type\":\"left\"}"
+      },
+      {
+        "lid": "l3", "cmid": null, "label": "menyebabkan",
+        "x": 440, "y": 520,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#DEDEDE\",\"width\":90,\"height\":22,\"type\":\"link\",\"limit\":9}",
+        "source_cid": "c4", "source_cmid": null,
+        "source_data": "{\"source\":\"l3\",\"target\":\"c4\",\"type\":\"left\"}"
+      },
+      {
+        "lid": "l4", "cmid": null, "label": "membutuhkan",
+        "x": 820, "y": 520,
+        "data": "{\"color\":\"#000000\",\"background-color\":\"#DEDEDE\",\"width\":90,\"height\":22,\"type\":\"link\",\"limit\":9}",
+        "source_cid": "c5", "source_cmid": null,
+        "source_data": "{\"source\":\"l4\",\"target\":\"c5\",\"type\":\"left\"}"
+      }
+    ],
+    "linktargets": [
+      {"lid":"l1","cmid":null,"target_cid":"c2","target_cmid":null,"target_data":"{\"source\":\"l1\",\"target\":\"c2\",\"type\":\"right\"}"},
+      {"lid":"l1","cmid":null,"target_cid":"c3","target_cmid":null,"target_data":"{\"source\":\"l1\",\"target\":\"c3\",\"type\":\"right\"}"},
+      {"lid":"l2","cmid":null,"target_cid":"c4","target_cmid":null,"target_data":"{\"source\":\"l2\",\"target\":\"c4\",\"type\":\"right\"}"},
+      {"lid":"l3","cmid":null,"target_cid":"c5","target_cmid":null,"target_data":"{\"source\":\"l3\",\"target\":\"c5\",\"type\":\"right\"}"},
+      {"lid":"l4","cmid":null,"target_cid":"c6","target_cmid":null,"target_data":"{\"source\":\"l4\",\"target\":\"c6\",\"type\":\"right\"}"}
+    ],
+    "concepts_ext": [],
+    "links_ext": [],
+    "linktargets_ext": []
+  },
+  "map": {
+    "cmid": "tsunami-example-001",
+    "direction": "multi"
+  }
+}
