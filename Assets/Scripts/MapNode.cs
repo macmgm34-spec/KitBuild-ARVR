@@ -3,12 +3,14 @@ using UnityEngine;
 using TMPro;
 
 /// <summary>
-/// Base class for ConceptNode and LinkNode.
-/// - Tap         → select, muncul tombol "→" (dan "←" untuk LinkNode)
-/// - Tap "→"     → connect forward (Concept→Link / Link→Concept target)
-/// - Tap "←"     → connect backward (Link←Concept sebagai source)
-/// - Tap node lain saat mode connect → sambungkan
-/// - Drag        → pindahkan node
+/// Base class for ConceptNode and LinkNode. Gesture mengikuti Kit-Build (kbx):
+/// - Tap              → pilih node; relasi terpilih memunculkan handle
+/// - Double-tap       → pilih node + semua tetangganya
+/// - Drag             → pindahkan node (atau seluruh seleksi), bisa di-undo
+/// - VR: saat drag, thumbstick ↑/↓ atau gerakan tangan maju/mundur → node menjauh/mendekat
+/// - Drag handle kiri (merah) / kanan (biru) → sambungkan source / target baru ke konsep
+/// - Drag handle koneksi → lepas di konsep lain = pindah, di ruang kosong = putus
+/// - Tap tombol centroid (bawah relasi, bila ≥ 2 koneksi) → relasi ke tengah konsepnya
 /// - Box auto-size menyesuaikan panjang teks + padding
 /// </summary>
 public abstract class MapNode : MonoBehaviour
@@ -38,39 +40,56 @@ public abstract class MapNode : MonoBehaviour
     protected const float PAD_X             = 0.032f; // dipepetkan, teks isi penuh kotak
     protected const float PAD_Y             = 0.024f;
     protected const float BTN_SIZE          = 0.05f;  // tombol 5cm
+    // Di VR node dilihat dari ±1.4m & ditunjuk ray yang goyang → target lebih besar
+    protected static float BtnSize => PointerInput.IsXR ? BTN_SIZE * 1.6f : BTN_SIZE;
 
-    // Tombol runtime
-    private GameObject       connectFwdBtn;   // "→"
-    private GameObject       connectBwdBtn;   // "←" (hanya LinkNode)
-    private GameObject       deleteConnBtn;   // "✕" (hanya LinkNode)
-    private MeshRenderer     fwdBtnMR, bwdBtnMR;
-    private MaterialPropertyBlock fwdBtnBlock, bwdBtnBlock;
+    // Handle relasi seperti kbx: kiri = source (left), kanan = target (right)
+    private GameObject       connectFwdBtn;   // handle kanan (target baru)
+    private GameObject       connectBwdBtn;   // handle kiri (source baru)
+    private GameObject       centroidBtn;     // KitBuildCentroidTool
+    private GameObject       remainingBadge;  // sisa target (drawLinkRemaining di kbx)
+    private TextMeshPro      remainingText;
+
+    // Handle per koneksi yang sudah ada (hanya relasi terpilih)
+    private readonly System.Collections.Generic.List<(GameObject go, ConceptMapManager.EdgeRef edge)> edgeHandles = new();
 
     // Gesture
+    private enum DragKind { None, Node, NewTarget, NewSource, MoveEdge, Centroid }
     private bool          isTracking;
     private int           trackedPointerId = -1;
     private PointerSample beganSample;
     private Vector3       dragOffset;
+    private float         dragDist;     // XR: jarak node di sepanjang ray
+    private float         lastReach;    // XR: jarak kepala → tangan saat frame sebelumnya
     private bool          hasDragged;
+    private DragKind      dragKind;
+    private ConceptMapManager.EdgeRef dragEdge;
+    private readonly System.Collections.Generic.List<(MapNode n, Vector3 from)> moveSet = new();
+    private bool          selectAfterMove;
 
-    // Mode koneksi
-    private enum ConnectMode { None, Forward, Backward }
-    private static MapNode      selectedNode  = null;
-    private static ConnectMode  connectMode   = ConnectMode.None;
-    private        bool         isSelected    = false;
+    // Seleksi (bisa lebih dari satu node, mis. hasil double-tap)
+    private static readonly System.Collections.Generic.List<MapNode> selection = new();
+    public  bool IsSelected => selection.Contains(this);
+    static  MapNode Primary => selection.Count == 1 ? selection[0] : null;
 
-    // Drag-from-arrow (drag tombol → node target, seperti versi web)
-    private ConnectMode btnDragMode    = ConnectMode.None;
-    private bool        connDragActive = false;
+    // Double-tap
+    const float DOUBLE_TAP_SEC    = 0.4f;
+    const float XR_DOUBLE_TAP_SEC = 0.55f;   // pinch/trigger 2× lebih lambat dari tap layar
+    private static MapNode lastTapNode;
+    private static float   lastTapTime;
+
+    // Jumlah gesture yang sedang berjalan di node mana pun (dua tangan di VR)
+    static int activeGestures;
+    public static bool GestureActive => activeGestures > 0;
 
     // Skin rounded-rect (desain versi web)
     private Texture2D texNormal;    // sudut membulat polos
     private Texture2D texSelected;  // + border merah (node terpilih)
-    private static Texture2D btnTexShared;  // rounded square untuk tombol
+    private static Texture2D texLeftHandle, texRightHandle, texCentroid, texBadge;
     static readonly Color SELECT_BORDER = new Color(0.90f, 0.42f, 0.45f, 1f); // merah muda web
 
-    protected virtual bool HasBackButton   => false;
-    protected virtual bool HasDeleteButton => false;
+    // Handle koneksi hanya ada di relasi (seperti kbx); konsep cukup tap & drag
+    protected virtual bool HasConnectButtons => false;
 
     // ──────────────────────────────────────────────
     void Awake()
@@ -89,6 +108,8 @@ public abstract class MapNode : MonoBehaviour
         Billboard();
         HandleTouch();
     }
+
+    void LateUpdate() => PositionEdgeHandles();
 
     // ── Billboard ─────────────────────────────────
     void Billboard()
@@ -193,7 +214,7 @@ public abstract class MapNode : MonoBehaviour
 
         // Material flat transparan (seperti web, tanpa lighting)
         meshRenderer.material = new Material(Shader.Find("Sprites/Default"));
-        SetMeshTexture(isSelected ? texSelected : texNormal);
+        SetMeshTexture(IsSelected ? texSelected : texNormal);
         SetMeshColor(GetBaseColor());
     }
 
@@ -207,6 +228,9 @@ public abstract class MapNode : MonoBehaviour
 
     /// Rounded-rect putih (di-tint via _Color); borderPx>0 → cincin border berwarna.
     static Texture2D MakeRoundedTex(int w, int h, float radius, float borderPx, Color borderCol)
+        => MakeRoundedTex(w, h, radius, borderPx, borderCol, Color.white);
+
+    static Texture2D MakeRoundedTex(int w, int h, float radius, float borderPx, Color borderCol, Color fill)
     {
         var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
         float hw = w * 0.5f, hh = h * 0.5f;
@@ -219,7 +243,7 @@ public abstract class MapNode : MonoBehaviour
             float d  = Mathf.Sqrt(dx * dx + dy * dy) - radius;
 
             float alpha = Mathf.Clamp01(0.5f - d);          // anti-alias 1px
-            Color c = (borderPx > 0f && d > -borderPx) ? borderCol : Color.white;
+            Color c = (borderPx > 0f && d > -borderPx) ? borderCol : fill;
             c.a = alpha;
             tex.SetPixel(x, y, c);
         }
@@ -242,61 +266,122 @@ public abstract class MapNode : MonoBehaviour
             1f);
     }
 
-    // ── Tombol "→" dan "←" ───────────────────────
-    // Warna handle disamakan dgn badge versi web: → biru, ← merah.
-    static readonly Color BTN_BLUE   = new Color(0.25f, 0.55f, 0.95f, 1f);
-    static readonly Color BTN_RED    = new Color(0.86f, 0.27f, 0.30f, 1f);
-    static readonly Color BTN_ACTIVE = new Color(1f, 0.6f, 0f, 1f);
+    // ── Handle relasi (gaya kbx) ──────────────────
+    // KitBuildLeftHandleTool / KitBuildRightHandleTool: bg + border, ikon → hitam
+    // (● bila peta bidirectional), di tengah sisi kiri/kanan node.
+    static readonly Color LEFT_BG   = new Color32(0xFF, 0xB5, 0xB8, 0xFF); // #ffb5b8
+    static readonly Color RIGHT_BG  = new Color32(0xA6, 0xEF, 0xFF, 0xFF); // #a6efff
+    static readonly Color TOOL_BORDER = new Color32(0x77, 0x77, 0x77, 0xCC); // #777777cc (tool default)
+    public static readonly Color LEFT_BORDER  = new Color32(0xEE, 0x22, 0x22, 0xFF); // #EE2222
+    public static readonly Color RIGHT_BORDER = new Color32(0x5B, 0xC0, 0xEB, 0xFF); // #5BC0EB
+    const float HANDLE_MARGIN = 8f / 36f;   // margin 8px untuk handle 36px di kbx
 
     void CreateButtons()
     {
-        connectFwdBtn = CreateBtn("FwdBtn", "→", BTN_BLUE, Color.white);
-        fwdBtnMR      = connectFwdBtn.GetComponent<MeshRenderer>();
-        fwdBtnBlock   = new MaterialPropertyBlock();
+        if (!HasConnectButtons) return;
+        connectFwdBtn = CreateHandle("RightHandle", source: false);
+        connectBwdBtn = CreateHandle("LeftHandle",  source: true);
         connectFwdBtn.SetActive(false);
+        connectBwdBtn.SetActive(false);
 
-        if (HasBackButton)
-        {
-            connectBwdBtn = CreateBtn("BwdBtn", "←", BTN_RED, Color.white);
-            bwdBtnMR      = connectBwdBtn.GetComponent<MeshRenderer>();
-            bwdBtnBlock   = new MaterialPropertyBlock();
-            connectBwdBtn.SetActive(false);
-        }
+        centroidBtn = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        centroidBtn.name = "CentroidTool";
+        centroidBtn.transform.SetParent(transform, false);
+        if (texCentroid == null) texCentroid = MakeCentroidTex(64);
+        var mr = centroidBtn.GetComponent<MeshRenderer>();
+        mr.material = new Material(Shader.Find("Sprites/Default")) { mainTexture = texCentroid };
+        centroidBtn.SetActive(false);
 
-        if (HasDeleteButton)
-        {
-            deleteConnBtn = CreateBtn("DelBtn", "X", BTN_RED, Color.white);
-            deleteConnBtn.SetActive(false);
-        }
+        // Badge sisa target: putih, border #DEDEDE, angka merah #CC0000, selalu tampil
+        remainingBadge = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        remainingBadge.name = "RemainingBadge";
+        remainingBadge.transform.SetParent(transform, false);
+        Destroy(remainingBadge.GetComponent<Collider>());   // indikator saja, tidak bisa di-tap
+        if (texBadge == null) texBadge = MakeBadgeTex(64);
+        remainingBadge.GetComponent<MeshRenderer>().material =
+            new Material(Shader.Find("Sprites/Default")) { mainTexture = texBadge };
+
+        var lbl = new GameObject("Lbl");
+        lbl.transform.SetParent(remainingBadge.transform, false);
+        remainingText           = lbl.AddComponent<TextMeshPro>();
+        remainingText.fontSize  = TMP_FONT_SIZE;
+        remainingText.color     = new Color32(0xCC, 0x00, 0x00, 0xFF);
+        remainingText.alignment = TMPro.TextAlignmentOptions.Center;
+        remainingText.enableAutoSizing = false;
+        lbl.transform.localPosition = new Vector3(0f, 0f, -0.1f);
+        lbl.transform.localScale    = new Vector3(0.5f, 0.5f, 1f);
+        remainingBadge.SetActive(false);
     }
 
-    GameObject CreateBtn(string objName, string icon, Color color, Color iconColor)
+    /// Sisa target yang masih bisa disambung (limit − target sekarang); ≤ 0 → disembunyikan
+    public void SetRemaining(int remaining)
+    {
+        if (remainingBadge == null) return;
+        remainingBadge.SetActive(remaining > 0);
+        if (remaining > 0) remainingText.text = remaining.ToString();
+    }
+
+    // Kotak putih border #DEDEDE, sudut membulat kecuali kiri-bawah (seperti kbx)
+    static Texture2D MakeBadgeTex(int n)
+    {
+        Color border = new Color32(0xDE, 0xDE, 0xDE, 0xFF);
+        float radius = n * 5f / 26f, bw = n * 3f / 26f;
+        var tex = MakeRoundedTex(n, n, radius, bw, border, Color.white);
+        for (int y = 0; y < radius; y++)
+        for (int x = 0; x < radius; x++)
+            tex.SetPixel(x, y, (x < bw || y < bw) ? border : Color.white);
+        tex.Apply();
+        return tex;
+    }
+
+    // Tool putih + border abu-abu, ikon 4 sudut menyempit (bi-fullscreen-exit di kbx)
+    static Texture2D MakeCentroidTex(int n)
+    {
+        var tex = MakeRoundedTex(n, n, 18f, 5f, TOOL_BORDER, Color.white);
+        int mid = n / 2, gap = n * 6 / 100, len = n * 14 / 100, th = n * 5 / 100;
+        void Corner(int sx, int sy)
+        {
+            // titik sudut L di dekat pusat, kaki mengarah keluar
+            int cx = mid + sx * gap, cy = mid + sy * gap;
+            for (int i = 0; i <= len; i++)
+            for (int t = 0; t < th; t++)
+            {
+                tex.SetPixel(cx + sx * i, cy + sy * t, Color.black);   // kaki horizontal
+                tex.SetPixel(cx + sx * t, cy + sy * i, Color.black);   // kaki vertikal
+            }
+        }
+        Corner(-1, -1); Corner(1, -1); Corner(-1, 1); Corner(1, 1);
+        tex.Apply();
+        return tex;
+    }
+
+    GameObject CreateHandle(string objName, bool source)
     {
         var btn = GameObject.CreatePrimitive(PrimitiveType.Quad);
         btn.name = objName;
         btn.transform.SetParent(transform, false);
 
-        // Rounded square + flat shader (desain web)
-        if (btnTexShared == null)
-            btnTexShared = MakeRoundedTex(64, 64, 18f, 0f, Color.white);
+        if (texLeftHandle == null)
+        {
+            texLeftHandle  = MakeRoundedTex(64, 64, 18f, 5f, LEFT_BORDER,  LEFT_BG);
+            texRightHandle = MakeRoundedTex(64, 64, 18f, 5f, RIGHT_BORDER, RIGHT_BG);
+        }
         var mr = btn.GetComponent<MeshRenderer>();
         mr.material = new Material(Shader.Find("Sprites/Default"));
         var block = new MaterialPropertyBlock();
-        block.SetTexture("_MainTex", btnTexShared);
-        block.SetColor("_Color", color);
+        block.SetTexture("_MainTex", source ? texLeftHandle : texRightHandle);
+        block.SetColor("_Color", Color.white);
         mr.SetPropertyBlock(block);
 
-        // Teks icon
         var lbl = new GameObject("Lbl");
         lbl.transform.SetParent(btn.transform, false);
         var tmp       = lbl.AddComponent<TextMeshPro>();
-        tmp.text      = icon;
+        tmp.text      = manager != null && manager.IsBidirectional ? "●" : "→";
         tmp.fontSize  = TMP_FONT_SIZE;
-        tmp.color     = iconColor;
+        tmp.color     = Color.black;
         tmp.alignment = TMPro.TextAlignmentOptions.Center;
         tmp.enableAutoSizing = false;
         lbl.transform.localPosition = new Vector3(0f, 0f, -0.1f);
-        // Dikompensasi thd kenaikan TMP_FONT_SIZE spy ikon tetap pas di badge kecil
         lbl.transform.localScale    = new Vector3(0.46f, 0.46f, 1f);
 
         return btn;
@@ -304,37 +389,46 @@ public abstract class MapNode : MonoBehaviour
 
     void UpdateButtonPositions(float nodeW, float nodeH)
     {
-        // Handle disematkan sebagai badge di SUDUT node (tumpang-tindih
-        // sedikit ke dalam), bukan melayang di tengah tepi dengan jarak —
-        // meniru gaya versi web (badge kecil menempel di pojok node).
-        float btnLocal    = BTN_SIZE / nodeW;
-        float btnLocalTop = BTN_SIZE / nodeH;
-        const float OVERLAP = 0.32f; // porsi badge yg masuk ke dalam node
-
-        float cornerX      = 0.5f - btnLocal * OVERLAP;
-        float cornerYBot   = -0.5f + btnLocalTop * OVERLAP;
-        float cornerYTop   = 0.5f - btnLocalTop * OVERLAP;
+        // kbx: gridPos x=-1 / x=1, y=0 → di luar tepi kiri/kanan, tengah vertikal
+        float btnLocal    = BtnSize / nodeW;
+        float btnLocalTop = BtnSize / nodeH;
+        float sideX       = 0.5f + (BtnSize * HANDLE_MARGIN + BtnSize * 0.5f) / nodeW;
 
         if (connectFwdBtn != null)
         {
-            // "→" di pojok kanan-bawah
             connectFwdBtn.transform.localScale    = new Vector3(btnLocal, btnLocalTop, 1f);
-            connectFwdBtn.transform.localPosition = new Vector3(cornerX, cornerYBot, -0.5f);
+            connectFwdBtn.transform.localPosition = new Vector3(sideX, 0f, -0.5f);
         }
-
         if (connectBwdBtn != null)
         {
-            // "←" di pojok kiri-bawah
             connectBwdBtn.transform.localScale    = new Vector3(btnLocal, btnLocalTop, 1f);
-            connectBwdBtn.transform.localPosition = new Vector3(-cornerX, cornerYBot, -0.5f);
+            connectBwdBtn.transform.localPosition = new Vector3(-sideX, 0f, -0.5f);
         }
-
-        if (deleteConnBtn != null)
+        if (centroidBtn != null)
         {
-            // "X" di pojok kanan-atas
-            deleteConnBtn.transform.localScale    = new Vector3(btnLocal, btnLocalTop, 1f);
-            deleteConnBtn.transform.localPosition = new Vector3(cornerX, cornerYTop, -0.5f);
+            float belowY = -(0.5f + (BtnSize * HANDLE_MARGIN + BtnSize * 0.5f) / nodeH);
+            centroidBtn.transform.localScale    = new Vector3(btnLocal, btnLocalTop, 1f);
+            centroidBtn.transform.localPosition = new Vector3(0f, belowY, -0.5f);
         }
+        if (remainingBadge != null)
+        {
+            // kbx: badge 26px berpusat di pojok kanan-atas node (handle 36px)
+            float bs = BtnSize * 26f / 36f;
+            remainingBadge.transform.localScale    = new Vector3(bs / nodeW, bs / nodeH, 1f);
+            remainingBadge.transform.localPosition = new Vector3(0.5f, 0.5f, -0.6f);
+        }
+    }
+
+    /// Jarak dari pusat node ke tepi kotaknya sepanjang arah dir (setara endpoint edge di kbx)
+    public static float BoundaryDistance(Transform node, Vector3 dir)
+    {
+        Vector3 s  = node.lossyScale;
+        float   dx = Mathf.Abs(Vector3.Dot(dir, node.right));
+        float   dy = Mathf.Abs(Vector3.Dot(dir, node.up));
+        float   tx = dx > 1e-4f ? s.x * 0.5f / dx : float.MaxValue;
+        float   ty = dy > 1e-4f ? s.y * 0.5f / dy : float.MaxValue;
+        float   t  = Mathf.Min(tx, ty);
+        return t == float.MaxValue ? 0f : t;
     }
 
     // ── Touch ─────────────────────────────────────
@@ -348,65 +442,105 @@ public abstract class MapNode : MonoBehaviour
                 var hit = RaycastMe(p.ray);
                 if (hit == null) continue;
 
-                // Cek tombol — arrow bisa DI-DRAG ke node target (seperti versi web)
-                if (IsBtn(hit.Value.transform, connectFwdBtn) ||
-                    IsBtn(hit.Value.transform, connectBwdBtn))
+                Transform t = hit.Value.transform;
+                dragKind = DragKind.Node;
+                dragEdge = null;
+                if      (IsBtn(t, connectFwdBtn)) dragKind = DragKind.NewTarget;
+                else if (IsBtn(t, connectBwdBtn)) dragKind = DragKind.NewSource;
+                else if (IsBtn(t, centroidBtn))   dragKind = DragKind.Centroid;
+                else
                 {
-                    btnDragMode = IsBtn(hit.Value.transform, connectFwdBtn)
-                        ? ConnectMode.Forward : ConnectMode.Backward;
-                    connDragActive = false;
-                    isTracking = true; trackedPointerId = p.id;
-                    beganSample = p; hasDragged = false;
-                    continue;
+                    foreach (var h in edgeHandles)
+                        if (IsBtn(t, h.go)) { dragKind = DragKind.MoveEdge; dragEdge = h.edge; break; }
                 }
-                if (IsBtn(hit.Value.transform, deleteConnBtn))
-                { OnDeleteBtn(); return; }
+                if (dragKind == DragKind.Node) ComputeDragOffset(p.ray);
 
                 isTracking = true; trackedPointerId = p.id;
                 beganSample = p; hasDragged = false;
-                ComputeDragOffset(p.ray);
+                activeGestures++;
             }
             else if (isTracking && p.id == trackedPointerId)
             {
                 if (p.phase == TouchPhase.Moved)
                 {
-                    if (hasDragged || PointerInput.BeyondDragThreshold(beganSample, p))
-                    {
-                        hasDragged = true;
-                        if (btnDragMode != ConnectMode.None)
-                        {
-                            // Drag garis koneksi dari arrow
-                            if (!connDragActive)
-                            { manager.BeginConnectionDrag(this, p); connDragActive = true; }
-                            manager.UpdateConnectionDrag(p);
-                        }
-                        else MoveNode(p.ray);
-                    }
+                    // VR: thumbstick saja (tanpa menggeser ray) juga memulai drag dorong/tarik
+                    bool depthInput = p.xr && dragKind == DragKind.Node && Mathf.Abs(p.depthAxis) > STICK_DEADZONE;
+                    if (!hasDragged && !depthInput && !PointerInput.BeyondDragThreshold(beganSample, p)) continue;
+                    if (!hasDragged) { hasDragged = true; OnDragStart(p); }
+
+                    if (dragKind == DragKind.Node) MoveNode(p);
+                    else if (dragKind != DragKind.None) manager.UpdateConnectionDrag(p);
                 }
                 else if (p.phase == TouchPhase.Ended || p.phase == TouchPhase.Canceled)
                 {
-                    if (btnDragMode != ConnectMode.None)
-                    {
-                        if (connDragActive)
-                        {
-                            // Lepas di node target → sambungkan
-                            manager.EndConnectionDrag(p, this,
-                                btnDragMode == ConnectMode.Backward);
-                            DeselectAll();
-                        }
-                        else
-                        {
-                            // Tap singkat di arrow → mode tap lama (fallback)
-                            if (btnDragMode == ConnectMode.Forward) OnFwdBtn();
-                            else OnBwdBtn();
-                        }
-                        btnDragMode = ConnectMode.None; connDragActive = false;
-                    }
-                    else if (!hasDragged) OnNodeTapped();
+                    bool canceled = p.phase == TouchPhase.Canceled;
+                    if (hasDragged) OnDragEnd(p, canceled);
+                    else if (!canceled) OnTap();
                     isTracking = false; trackedPointerId = -1;
+                    dragKind = DragKind.None; dragEdge = null;
+                    activeGestures = Mathf.Max(0, activeGestures - 1);
                 }
             }
         }
+    }
+
+    void OnDragStart(PointerSample p)
+    {
+        if (dragKind == DragKind.Centroid) { dragKind = DragKind.None; return; }
+        if (dragKind != DragKind.Node)
+        {
+            bool sourceHandle = dragKind == DragKind.NewSource
+                             || (dragKind == DragKind.MoveEdge && dragEdge != null && dragEdge.isSource);
+            if (!manager.BeginConnectionDrag(this, p, sourceHandle))
+                dragKind = DragKind.None;   // tangan lain sedang menarik koneksi
+            return;
+        }
+
+        // Drag node yang belum terpilih → seleksi lain dilepas (seperti kbx)
+        selectAfterMove = !IsSelected;
+        if (selectAfterMove) DeselectAll();
+
+        if (p.xr)
+        {
+            // Pegang node di jaraknya sekarang sepanjang ray; offset tegak lurus ray dipertahankan
+            dragDist   = Mathf.Max(Vector3.Dot(transform.position - p.ray.origin, p.ray.direction), MIN_DRAG_DIST);
+            dragOffset = transform.position - p.ray.GetPoint(dragDist);
+            lastReach  = p.reach;
+        }
+
+        moveSet.Clear();
+        if (IsSelected)
+            foreach (var n in selection) { if (n) moveSet.Add((n, n.transform.position)); }
+        else
+            moveSet.Add((this, transform.position));
+    }
+
+    void OnDragEnd(PointerSample p, bool canceled)
+    {
+        switch (dragKind)
+        {
+            case DragKind.Node:
+                manager.CommitMove(moveSet);
+                moveSet.Clear();
+                if (selectAfterMove) SelectMe();
+                break;
+            case DragKind.NewTarget:
+            case DragKind.NewSource:
+                if (canceled) manager.CancelConnectionDrag();
+                else manager.EndConnectionDrag(p, this, dragKind == DragKind.NewSource);
+                break;
+            case DragKind.MoveEdge:
+                if (canceled) manager.CancelConnectionDrag();
+                else manager.EndEdgeMove(p, this, dragEdge);
+                break;
+        }
+    }
+
+    // Seperti kbx, tap pada handle tidak melakukan apa-apa — handle hanya untuk di-drag
+    void OnTap()
+    {
+        if      (dragKind == DragKind.Node)     OnNodeTapped();
+        else if (dragKind == DragKind.Centroid) manager.CentroidLink(this);
     }
 
     RaycastHit? RaycastMe(Ray ray)
@@ -424,78 +558,156 @@ public abstract class MapNode : MonoBehaviour
         if (p.Raycast(r, out float d)) dragOffset = transform.position - r.GetPoint(d);
     }
 
-    void MoveNode(Ray r)
+    // Dorong/tarik di VR: thumbstick (m/detik) + gerakan tangan maju/mundur diperkuat
+    const float STICK_DEADZONE = 0.2f;
+    const float DEPTH_SPEED    = 1.2f;
+    const float REACH_GAIN     = 3f;
+    const float MIN_DRAG_DIST  = 0.3f;
+    const float MAX_DRAG_DIST  = 6f;
+
+    void MoveNode(PointerSample s)
     {
-        Plane p = new Plane(arCamera.transform.forward, transform.position);
-        if (p.Raycast(r, out float d)) transform.position = r.GetPoint(d) + dragOffset;
+        Vector3 target;
+        if (s.xr)
+        {
+            float stick = Mathf.Abs(s.depthAxis) > STICK_DEADZONE ? s.depthAxis : 0f;
+            dragDist += stick * DEPTH_SPEED * Time.deltaTime + (s.reach - lastReach) * REACH_GAIN;
+            dragDist  = Mathf.Clamp(dragDist, MIN_DRAG_DIST, MAX_DRAG_DIST);
+            lastReach = s.reach;
+            target    = s.ray.GetPoint(dragDist) + dragOffset;
+        }
+        else
+        {
+            Plane p = new Plane(arCamera.transform.forward, transform.position);
+            if (!p.Raycast(s.ray, out float d)) return;
+            target = s.ray.GetPoint(d) + dragOffset;
+        }
+
+        Vector3 delta = target - transform.position;
+        foreach (var (n, _) in moveSet)
+            if (n) n.transform.position += delta;
     }
 
     // ── Tap logic ─────────────────────────────────
     void OnNodeTapped()
     {
-        if (selectedNode != null && selectedNode != this && connectMode != ConnectMode.None)
+        float now = Time.unscaledTime;
+        float window = PointerInput.IsXR ? XR_DOUBLE_TAP_SEC : DOUBLE_TAP_SEC;
+        if (lastTapNode == this && now - lastTapTime < window)
         {
-            // Connect!
-            if (connectMode == ConnectMode.Backward)
-                manager.TryConnect(this, selectedNode); // this=Concept, selected=Link
-            else
-                manager.TryConnect(selectedNode, this);
-            DeselectAll();
+            lastTapNode = null;
+            manager.SelectNeighborhood(this);
             return;
         }
-        if (isSelected) { DeselectAll(); return; }
-        DeselectAll();
+        lastTapNode = this;
+        lastTapTime = now;
+
+        if (IsSelected && selection.Count == 1) { DeselectAll(); return; }
         SelectMe();
     }
 
-    void OnFwdBtn()
-    {
-        connectMode = ConnectMode.Forward;
-        SetBtnColor(fwdBtnMR, fwdBtnBlock, BTN_ACTIVE);
-        manager.ShowStatus(this is ConceptNode
-            ? "Tap node Relasi untuk sambungkan sebagai source"
-            : "Tap node Konsep untuk sambungkan sebagai target");
-    }
-
-    void OnBwdBtn()
-    {
-        connectMode = ConnectMode.Backward;
-        SetBtnColor(bwdBtnMR, bwdBtnBlock, BTN_ACTIVE);
-        manager.ShowStatus("Tap node Konsep untuk set sebagai source relasi ini");
-    }
-
-    void OnDeleteBtn()
-    {
-        manager.ClearLinkConnections(NodeId);
-        DeselectAll();
-    }
-
+    // ── Seleksi ───────────────────────────────────
     void SelectMe()
     {
-        selectedNode = this; isSelected = true;
-        connectMode  = ConnectMode.None;
+        DeselectAll();
+        selection.Add(this);
         SetSelectedVisual(true);
-        if (connectFwdBtn != null) connectFwdBtn.SetActive(true);
-        if (connectBwdBtn != null) connectBwdBtn.SetActive(true);
-        if (deleteConnBtn != null) deleteConnBtn.SetActive(true);
-        manager.ShowStatus("Tap → / ← untuk connect | X hapus koneksi | drag pindah");
+        RefreshHandles();
+        manager.ShowStatus(this is LinkNode
+            ? "Drag handle kiri/kanan ke konsep | drag handle koneksi untuk pindah/putus"
+            : "Drag untuk pindah | double-tap pilih tetangga");
+    }
+
+    public static void SelectGroup(System.Collections.Generic.IEnumerable<MapNode> nodes)
+    {
+        DeselectAll();
+        foreach (var n in nodes)
+        {
+            if (n == null || selection.Contains(n)) continue;
+            selection.Add(n);
+            n.SetSelectedVisual(true);
+        }
+        if (selection.Count == 1) selection[0].RefreshHandles();
     }
 
     public static void DeselectAll()
     {
-        if (selectedNode != null)
+        foreach (var n in selection)
         {
-            selectedNode.SetSelectedVisual(false);
-            selectedNode.isSelected = false;
-            if (selectedNode.connectFwdBtn != null) selectedNode.connectFwdBtn.SetActive(false);
-            if (selectedNode.connectBwdBtn != null) selectedNode.connectBwdBtn.SetActive(false);
-            if (selectedNode.deleteConnBtn != null) selectedNode.deleteConnBtn.SetActive(false);
-            // Reset warna tombol ke warna resting masing-masing
-            selectedNode.SetBtnColor(selectedNode.fwdBtnMR, selectedNode.fwdBtnBlock, BTN_BLUE);
-            selectedNode.SetBtnColor(selectedNode.bwdBtnMR, selectedNode.bwdBtnBlock, BTN_RED);
-            selectedNode = null;
+            if (n == null) continue;
+            n.SetSelectedVisual(false);
+            n.HideHandles();
         }
-        connectMode = ConnectMode.None;
+        selection.Clear();
+    }
+
+    /// Dipanggil manager setiap kali koneksi berubah (connect, putus, undo, ...)
+    public static void RefreshSelectedHandles()
+    {
+        var p = Primary;
+        if (p != null) p.RefreshHandles();
+    }
+
+    void RefreshHandles()
+    {
+        HideHandles();
+        if (!HasConnectButtons || manager == null) return;
+
+        // Seperti kbx: handle kiri hanya bila belum ada source, kanan selama target < limit
+        var edges = manager.GetEdges(NodeId);
+        int targets = 0;
+        bool hasSource = false;
+        foreach (var e in edges)
+        {
+            if (e.isSource) hasSource = true; else targets++;
+            edgeHandles.Add((CreateHandle("EdgeHandle", e.isSource), e));
+        }
+        if (connectBwdBtn != null) connectBwdBtn.SetActive(!hasSource);
+        if (connectFwdBtn != null) connectFwdBtn.SetActive(targets < manager.GetLinkLimit(NodeId));
+        if (centroidBtn   != null) centroidBtn.SetActive(edges.Count > 1);   // kbx: connectedEdges > 1
+        PositionEdgeHandles();
+    }
+
+    void HideHandles()
+    {
+        if (connectFwdBtn != null) connectFwdBtn.SetActive(false);
+        if (connectBwdBtn != null) connectBwdBtn.SetActive(false);
+        if (centroidBtn   != null) centroidBtn.SetActive(false);
+        foreach (var h in edgeHandles) if (h.go) Destroy(h.go);
+        edgeHandles.Clear();
+    }
+
+    // Handle koneksi diletakkan tepat di ujung garis pada tepi konsep
+    // (renderedTargetEndpoint di kbx).
+    void PositionEdgeHandles()
+    {
+        if (edgeHandles.Count == 0 || manager == null) return;
+
+        Vector3 ls   = transform.lossyScale;
+        float   zoom = AutoBaseScale.x > 0f ? transform.localScale.x / AutoBaseScale.x : 1f;
+        float   size = BtnSize * zoom;
+        Vector3 toCam = arCamera != null ? (arCamera.transform.position - transform.position).normalized : Vector3.zero;
+
+        foreach (var (go, e) in edgeHandles)
+        {
+            var c = manager.GetNode(e.ConceptId);
+            if (go == null || c == null) continue;
+
+            Vector3 cp  = c.transform.position;
+            Vector3 dir = transform.position - cp;
+            if (dir.sqrMagnitude < 1e-6f) dir = c.transform.right;
+            dir.Normalize();
+
+            go.transform.position   = cp + dir * BoundaryDistance(c.transform, dir) + toCam * 0.01f;
+            go.transform.localScale = new Vector3(size / ls.x, size / ls.y, 1f);
+
+            // kbx drawImageRot: ikon diputar searah edge relasi→konsep,
+            // +180° untuk handle kiri (jadi menunjuk konsep→relasi)
+            Vector3 v   = e.isSource ? dir : -dir;
+            float angle = Mathf.Atan2(Vector3.Dot(v, go.transform.up), Vector3.Dot(v, go.transform.right)) * Mathf.Rad2Deg;
+            if (go.transform.childCount > 0)
+                go.transform.GetChild(0).localRotation = Quaternion.Euler(0f, 0f, angle);
+        }
     }
 
     void SetSelectedVisual(bool on)
@@ -504,18 +716,6 @@ public abstract class MapNode : MonoBehaviour
         if (texSelected != null) SetMeshTexture(on ? texSelected : texNormal);
         else SetMeshColor(on ? Color.Lerp(GetBaseColor(), Color.white, 0.45f) : GetBaseColor());
     }
-
-    void SetBtnColor(MeshRenderer mr, MaterialPropertyBlock block, Color c)
-    {
-        if (mr == null || block == null) return;
-        mr.GetPropertyBlock(block);          // pertahankan texture rounded
-        block.SetColor("_Color", c);
-        mr.SetPropertyBlock(block);
-    }
-
-    public void SetHighlight(bool on)
-        // Highlight dimatikan — warna node tetap apa adanya
-        => SetMeshColor(GetBaseColor());
 
     void SetMeshColor(Color c)
     {

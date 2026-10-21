@@ -134,6 +134,27 @@ public static class ToolbarIcons
         return ToSprite(t);
     }
 
+    /// Centang ✓ (periksa jawaban)
+    public static Sprite Check()
+    {
+        var t = NewTex();
+        Stroke(t, 12, 32, 26, 18, 5, W);
+        Stroke(t, 26, 18, 52, 46, 5, W);
+        return ToSprite(t);
+    }
+
+    // Garis tebal dari (x0,y0) ke (x1,y1)
+    static void Stroke(Texture2D t, int x0, int y0, int x1, int y1, int r, Color c)
+    {
+        int steps = Mathf.Max(Mathf.Abs(x1 - x0), Mathf.Abs(y1 - y0));
+        for (int i = 0; i <= steps; i++)
+        {
+            int x = Mathf.RoundToInt(Mathf.Lerp(x0, x1, i / (float)steps));
+            int y = Mathf.RoundToInt(Mathf.Lerp(y0, y1, i / (float)steps));
+            Rect(t, x - r, y - r, x + r, y + r, c);
+        }
+    }
+
     /// Kurung kurawal { } (JSON)
     public static Sprite Json()
     {

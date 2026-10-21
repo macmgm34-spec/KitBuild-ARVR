@@ -7,8 +7,20 @@ using Newtonsoft.Json;
 [Serializable]
 public class ConceptMapFile
 {
+    public MetaInfo   meta;     // opsional: info soal + kunci jawaban
     public CanvasData canvas;
     public MapInfo    map;
+}
+
+/// Info soal. Proposisi ditulis "Sumber --[relasi]--> Target".
+[Serializable]
+public class MetaInfo
+{
+    public string       topik;
+    public int          level;
+    public string       instruksi;
+    public List<string> kunci_jawaban    = new();
+    public string       proposisi_contoh;   // contoh yang sudah diberikan (tidak dinilai)
 }
 
 [Serializable]
@@ -88,5 +100,5 @@ public class NodeVisualData
     public float  width            = 70;
     public float  height           = 22;
     public string type             = "concept";
-    public int    limit            = 9;
+    public int?   limit;            // null = tanpa batas target
 }

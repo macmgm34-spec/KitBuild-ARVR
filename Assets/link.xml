@@ -1,0 +1,10 @@
+<!-- Collider primitive dipakai lewat GameObject.CreatePrimitive di runtime
+     (titik ujung koneksi, kursor ray, model controller). Jangan di-strip saat build. -->
+<linker>
+  <assembly fullname="UnityEngine.PhysicsModule">
+    <type fullname="UnityEngine.SphereCollider" preserve="all"/>
+    <type fullname="UnityEngine.CapsuleCollider" preserve="all"/>
+    <type fullname="UnityEngine.BoxCollider" preserve="all"/>
+    <type fullname="UnityEngine.MeshCollider" preserve="all"/>
+  </assembly>
+</linker>
