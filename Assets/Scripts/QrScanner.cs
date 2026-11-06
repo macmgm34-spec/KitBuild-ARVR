@@ -46,18 +46,27 @@ public class QrScanner : MonoBehaviour
         onResult   = result;
         onError    = error;
         IsScanning = true;
-        if (PointerInput.IsXR) XRSupport.Instance.Passthrough = true;
+        ShowCamera(true);
         StartCoroutine(ScanRoutine());
     }
 
     public void Stop()
     {
         IsScanning = false;
-        if (PointerInput.IsXR) XRSupport.Instance.Passthrough = false;
+        ShowCamera(false);
         if (aimFrame != null) { Destroy(aimFrame.gameObject); aimFrame = null; }
     }
 
     void OnDestroy() => Stop();
+
+    // Gambar kamera hanya tampil selama scan supaya QR terlihat:
+    // Quest lewat passthrough, HP lewat ARCameraBackground (di luar scan latar putih).
+    static void ShowCamera(bool on)
+    {
+        if (PointerInput.IsXR) { XRSupport.Instance.Passthrough = on; return; }
+        var bg = FindAnyObjectByType<ARCameraBackground>();
+        if (bg != null) bg.enabled = on;
+    }
 
     IEnumerator ScanRoutine()
     {

@@ -43,7 +43,11 @@ public class XRSupport : MonoBehaviour
         public int          id;
         public InputAction  position, rotation, select;
         public LineRenderer line;
-        public Transform    cursor;
+        public Transform    cursor;           // ikon tangan di ujung ray
+        public MeshRenderer cursorRenderer;
+        public MaterialPropertyBlock cursorBlock;
+        public HandCursor.Pose cursorPose = (HandCursor.Pose)(-1);
+        public bool         grabbing;         // tekan dimulai di atas node/handle
         public bool         tracked;
         public Ray          ray;
         public InternedString usage;          // LeftHand / RightHand
@@ -116,7 +120,41 @@ public class XRSupport : MonoBehaviour
 
         ScanCanvases();
         if (recenterAction.WasPressedThisFrame()) panelPlaced = false;
+        UpdateCenterCombo();
         FollowHead();
+    }
+
+    // ── Combo "Pusat": peta + menu pindah ke depan wajah ──────────
+    // Kedua grip controller ditahan, ATAU trigger/pinch kedua tangan di ruang kosong ditahan.
+    const float COMBO_HOLD = 0.6f;
+    float comboTimer;
+    bool  comboFired;
+
+    void UpdateCenterCombo()
+    {
+        if (hands == null) return;
+        bool bothSelect = hands[0].select.IsPressed() && hands[1].select.IsPressed()
+                       && !hands[0].grabbing && !hands[1].grabbing;
+        bool bothGrip   = GripPressed(hands[0]) && GripPressed(hands[1]);
+
+        if (!bothSelect && !bothGrip) { comboTimer = 0f; comboFired = false; return; }
+
+        comboTimer += Time.unscaledDeltaTime;
+        if (comboFired || comboTimer < COMBO_HOLD) return;
+        comboFired = true;
+
+        var manager = FindFirstObjectByType<ConceptMapManager>();
+        if (manager != null) manager.CenterNodes();
+        panelPlaced = false;
+        var toolbar = FindFirstObjectByType<AppToolbar>();
+        if (toolbar != null) toolbar.ShowToast("Peta dipindah ke depan", 1.5f);
+    }
+
+    static bool GripPressed(Hand h)
+    {
+        if (h.controller == null) return false;
+        var grip = h.controller.TryGetChildControl<UnityEngine.InputSystem.Controls.ButtonControl>("gripPressed");
+        return grip != null && grip.isPressed;
     }
 
     void LateUpdate()
@@ -193,14 +231,16 @@ public class XRSupport : MonoBehaviour
         h.line.endColor       = new Color(1f, 1f, 1f, 0.15f);
         h.line.enabled        = false;
 
-        var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        Destroy(dot.GetComponent<Collider>());
-        dot.name = $"{side}Cursor";
-        dot.transform.SetParent(transform, false);
-        dot.transform.localScale = Vector3.one * 0.012f;
-        dot.GetComponent<MeshRenderer>().material = h.line.material;
-        dot.SetActive(false);
-        h.cursor = dot.transform;
+        // Sama seperti handle relasi: quad + Sprites/Default, tekstur lewat property block
+        var cursor = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        Destroy(cursor.GetComponent<Collider>());
+        cursor.name = $"{side}Cursor";
+        DontDestroyOnLoad(cursor);
+        h.cursorRenderer = cursor.GetComponent<MeshRenderer>();
+        h.cursorRenderer.material = new Material(Shader.Find("Sprites/Default"));
+        h.cursorBlock = new MaterialPropertyBlock();
+        cursor.SetActive(false);
+        h.cursor = cursor.transform;
 
         BuildControllerModel(h, side);
         return h;
@@ -372,18 +412,61 @@ public class XRSupport : MonoBehaviour
             return;
         }
 
-        float length = RAY_LENGTH;
-        bool  hit    = false;
-        if (Physics.Raycast(h.ray, out RaycastHit physHit, RAY_LENGTH)) { length = physHit.distance; hit = true; }
-        if (RaycastUI(h.ray, out float uiDist) && uiDist < length)     { length = uiDist;           hit = true; }
+        float   length = RAY_LENGTH;
+        bool    hit    = false;
+        MapNode node   = null;   // node yang ditunjuk
+        bool    onBody = false;  // kena badan kotak (bukan handle/tombol)
+        if (Physics.Raycast(h.ray, out RaycastHit physHit, RAY_LENGTH))
+        {
+            length = physHit.distance; hit = true;
+            node   = physHit.transform.GetComponentInParent<MapNode>();
+            onBody = node != null && physHit.transform == node.transform;
+        }
+        if (RaycastUI(h.ray, out float uiDist) && uiDist < length) { length = uiDist; hit = true; node = null; onBody = false; }
 
         Vector3 end = h.ray.GetPoint(length);
         h.line.enabled = true;
         h.line.SetPosition(0, h.ray.origin);
         h.line.SetPosition(1, end);
-        h.cursor.gameObject.SetActive(hit);
-        h.cursor.position = end;
+
+        // Pose kursor: genggam saat memegang node/handle, terbuka di atas node, selain itu menunjuk
+        if (h.select.WasPressedThisFrame()) h.grabbing = node != null;
+        if (!h.select.IsPressed())          h.grabbing = false;
+        var pose = h.grabbing ? HandCursor.Pose.Grab : onBody ? HandCursor.Pose.Open : HandCursor.Pose.Point;
+        UpdateCursor(h, hit ? end : h.ray.GetPoint(CURSOR_IDLE_DIST), pose);
     }
+
+    const float CURSOR_IDLE_DIST = 1.2f;   // posisi kursor saat ray tidak mengenai apa pun
+    const float CURSOR_ANGLE     = 0.05f;  // ukuran ≈ 2,9° pandangan, berapa pun jaraknya
+
+    void UpdateCursor(Hand h, Vector3 point, HandCursor.Pose pose)
+    {
+        if (cam == null) return;
+        if (h.cursorPose != pose)
+        {
+            h.cursorPose = pose;
+            h.cursorRenderer.GetPropertyBlock(h.cursorBlock);
+            h.cursorBlock.SetTexture("_MainTex", HandCursor.Get(pose));
+            h.cursorBlock.SetColor("_Color", Color.white);
+            h.cursorRenderer.SetPropertyBlock(h.cursorBlock);
+        }
+
+        Transform head = cam.transform;
+        float   dist = Vector3.Distance(head.position, point);
+        float   size = Mathf.Max(0.02f, dist * CURSOR_ANGLE);
+        Vector3 toCam = (head.position - point).normalized;
+        Quaternion rot = Quaternion.LookRotation(-toCam, head.up);
+
+        // Geser quad supaya titik tunjuk ikon (ujung telunjuk) tepat di titik yang ditunjuk
+        Vector2 hs = HandCursor.Hotspot(pose) - new Vector2(0.5f, 0.5f);
+        Vector3 offset = rot * new Vector3(-hs.x * size, -hs.y * size, 0f);
+
+        h.cursor.gameObject.SetActive(true);
+        h.cursor.SetPositionAndRotation(point + offset + toCam * 0.03f, rot);
+        h.cursor.localScale = new Vector3(size, size, 1f);
+
+    }
+
 
     void ConfigureUIModule()
     {

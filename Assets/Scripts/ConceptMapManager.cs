@@ -76,6 +76,10 @@ public class ConceptMapManager : MonoBehaviour
     private const float MAX_SCALE = 3.0f;
 
     private const float XR_MAP_DIST     = 1.4f;
+
+    // HP: ukuran kotak tetap (meter), jadi peta ditaruh lebih jauh saat layar
+    // tegak (sempit) supaya kotak tampak lebih kecil dan tidak bertumpuk.
+    float PhoneMapDist => arCamera != null && arCamera.aspect < 1f ? 2.2f : 1.4f;
     private const float XR_MAP_WIDTH    = 1.4f;
     private const float XR_MAP_HEIGHT   = 0.8f;
     private const float XR_PLACE_DIST   = 1.2f;
@@ -121,10 +125,10 @@ public class ConceptMapManager : MonoBehaviour
     // ──────────────────────────────────────────────
     void Start()
     {
-        // Background putih polos — matikan passthrough kamera AR (spt versi web).
-        // AR plane detection & tracking tetap jalan di belakang layar, hanya
-        // gambar kamera yang tak dirender.
-        if (arCamera != null && !PointerInput.IsXR)   // VR: latar diatur XRSupport (transparan)
+        // HP: latar putih polos (seperti versi web), gambar kamera tidak dirender.
+        // Tracking AR tetap jalan, jadi peta tetap terkunci di ruang nyata;
+        // lantai grid memberi kesan 3D saat HP digerakkan. (VR: latar diatur XRSupport.)
+        if (arCamera != null && !PointerInput.IsXR)
         {
             var camBg = arCamera.GetComponent<ARCameraBackground>();
             if (camBg != null) camBg.enabled = false;
@@ -263,10 +267,21 @@ public class ConceptMapManager : MonoBehaviour
 
     // ── Tracking status label ─────────────────────
     // Canvas dibiarkan bersih (tanpa teks status) — hanya tombol yang tampil.
+    float trackingHintTimer;
+
     void UpdateTrackingStatus()
     {
         if (trackingText != null && trackingText.gameObject.activeSelf)
             trackingText.gameObject.SetActive(false);
+
+        // HP: selama ARCore belum mengunci posisi, minta pengguna menggerakkan HP
+        if (PointerInput.IsXR || ARSession.state < ARSessionState.SessionInitializing) return;
+        trackingHintTimer -= Time.unscaledDeltaTime;
+        if (IsTracking || trackingHintTimer > 0f) return;
+        trackingHintTimer = 4f;
+        if (toolbar == null) toolbar = FindFirstObjectByType<AppToolbar>();
+        if (toolbar != null)
+            toolbar.ShowToast("Gerakkan HP perlahan ke kiri dan kanan\nsambil mengarah ke meja atau lantai", 3.5f);
     }
 
     // ─────────────────────────────────────────────
@@ -274,7 +289,7 @@ public class ConceptMapManager : MonoBehaviour
     // ─────────────────────────────────────────────
     public void ApplyMapJson(string json)
     {
-        if (PointerInput.IsXR && !XRSupport.Instance.HeadTracked)
+        if (!IsTracking)
         {
             StartCoroutine(ApplyMapJsonWhenTracked(json));
             return;
@@ -282,10 +297,16 @@ public class ConceptMapManager : MonoBehaviour
         ApplyMapJsonNow(json);
     }
 
+    // VR: kepala sudah ter-track. HP: ARCore sudah mengunci posisi (SessionTracking).
+    bool IsTracking => PointerInput.IsXR ? XRSupport.Instance.HeadTracked
+                                         : ARSession.state == ARSessionState.SessionTracking;
+
     IEnumerator ApplyMapJsonWhenTracked(string json)
     {
+        // HP butuh digerakkan sedikit supaya ARCore bisa mulai melacak
+        float limit  = PointerInput.IsXR ? 3f : 12f;
         float waited = 0f;
-        while (!XRSupport.Instance.HeadTracked && waited < 3f)
+        while (!IsTracking && waited < limit)
         {
             waited += Time.unscaledDeltaTime;
             yield return null;
@@ -331,7 +352,7 @@ public class ConceptMapManager : MonoBehaviour
 
         // Fit ke FOV kamera: seluruh peta langsung terlihat tanpa pinch-zoom.
         // Dihitung dari sudut pandang kamera → otomatis benar di portrait & landscape.
-        float DIST = 1.0f;                             // jarak peta dari kamera
+        float DIST = PhoneMapDist;                     // jarak peta dari kamera
         float vFov   = arCamera.fieldOfView * Mathf.Deg2Rad;
         float worldH = 2f * DIST * Mathf.Tan(vFov * 0.5f) * 0.65f;   // 65% tinggi layar
         float worldW = worldH * arCamera.aspect * 0.9f;               // 90% lebar layar
@@ -346,6 +367,7 @@ public class ConceptMapManager : MonoBehaviour
         float scale  = Mathf.Min(scaleX, scaleY);
 
         GetViewBasis(out Vector3 camPos, out Vector3 fwd, out Vector3 right, out Vector3 up);
+        if (!PointerInput.IsXR) PlaceFloorGrid(camPos, fwd, DIST);
         Vector3 origin = camPos
                        + fwd   * DIST
                        - right * worldW * 0.5f
@@ -375,6 +397,54 @@ public class ConceptMapManager : MonoBehaviour
 
         // Draw connections
         DrawAllConnections();
+    }
+
+    // ── Lantai grid (HP) ──────────────────────────
+    // Grid abu-abu tipis yang menempel di ruang nyata di bawah peta. Dengan latar
+    // putih, grid inilah yang membuat perspektif & gerakan HP terasa 3D.
+    const float FLOOR_DROP = 1.3f;   // ± tinggi HP dari lantai saat dipegang
+    const float FLOOR_SIZE = 24f;    // meter
+    const float FLOOR_CELL = 0.5f;   // meter per kotak grid
+    GameObject floorGrid;
+
+    void PlaceFloorGrid(Vector3 camPos, Vector3 fwd, float dist)
+    {
+        if (floorGrid == null) floorGrid = CreateFloorGrid();
+        Vector3 flatFwd = Vector3.ProjectOnPlane(fwd, Vector3.up);
+        if (flatFwd.sqrMagnitude < 1e-4f) flatFwd = Vector3.forward;
+        flatFwd.Normalize();
+        floorGrid.transform.SetPositionAndRotation(
+            new Vector3(camPos.x, camPos.y - FLOOR_DROP, camPos.z) + flatFwd * dist,
+            Quaternion.LookRotation(flatFwd, Vector3.up));
+    }
+
+    static GameObject CreateFloorGrid()
+    {
+        var go = new GameObject("FloorGrid");
+        float h = FLOOR_SIZE * 0.5f, tiles = FLOOR_SIZE / FLOOR_CELL;
+        var mesh = new Mesh
+        {
+            vertices  = new[] { new Vector3(-h, 0, -h), new Vector3(h, 0, -h), new Vector3(-h, 0, h), new Vector3(h, 0, h) },
+            uv        = new[] { new Vector2(0, 0), new Vector2(tiles, 0), new Vector2(0, tiles), new Vector2(tiles, tiles) },
+            triangles = new[] { 0, 2, 1, 1, 2, 3 },
+        };
+        go.AddComponent<MeshFilter>().mesh = mesh;
+
+        // Satu sel: garis tepi abu-abu, isi transparan; mipmap meredam kedip di kejauhan
+        const int N = 64;
+        var tex = new Texture2D(N, N, TextureFormat.RGBA32, true)
+        {
+            wrapMode = TextureWrapMode.Repeat, filterMode = FilterMode.Trilinear, anisoLevel = 8,
+        };
+        var line = new Color(0.55f, 0.58f, 0.63f, 0.55f);
+        var clear = new Color(0.55f, 0.58f, 0.63f, 0f);
+        for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++)
+            tex.SetPixel(x, y, (x < 2 || y < 2) ? line : clear);
+        tex.Apply(true);
+
+        go.AddComponent<MeshRenderer>().material = new Material(Shader.Find("Sprites/Default")) { mainTexture = tex };
+        return go;
     }
 
     static int ParseIdNum(string id)
@@ -1035,7 +1105,7 @@ public class ConceptMapManager : MonoBehaviour
         }
 
         // Tempatkan pusat grup di depan kamera
-        Vector3 newCenter = camPos + fwd * (PointerInput.IsXR ? XR_MAP_DIST : 1.0f);
+        Vector3 newCenter = camPos + fwd * (PointerInput.IsXR ? XR_MAP_DIST : PhoneMapDist);
         foreach (var (n, x, y) in offsets)
             n.transform.position = newCenter + right * x + up * y;
 

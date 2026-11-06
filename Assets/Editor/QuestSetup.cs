@@ -20,6 +20,9 @@ public static class QuestSetup
     const string XRSIM_LOADER  = "UnityEngine.XR.Simulation.SimulationLoader";
     const string ACTIVE_RUNTIME = "/usr/local/share/openxr/1/active_runtime.json";
     const string QUEST_APK     = "Builds/ConceptMapAR-Quest.apk";
+    const string PHONE_APK     = "Builds/KitBuildAR.apk";
+    const string NAME_VR       = "Kit Build VR";   // nama app di Quest
+    const string NAME_AR       = "Kit Build AR";   // nama app di HP
 
     static readonly HashSet<string> QuestFeatures = new()
     {
@@ -55,6 +58,7 @@ public static class QuestSetup
         }
         EditorUtility.SetDirty(openxr);
 
+        PlayerSettings.productName = NAME_VR;
         PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
         PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new[] { GraphicsDeviceType.Vulkan });
         PlayerSettings.SetScriptingBackend(NamedBuildTarget.Android, ScriptingImplementation.IL2CPP);
@@ -136,6 +140,7 @@ public static class QuestSetup
         XRPackageMetadataStore.RemoveLoader(manager, OPENXR_LOADER, BuildTargetGroup.Android);
         XRPackageMetadataStore.AssignLoader(manager, ARCORE_LOADER, BuildTargetGroup.Android);
 
+        PlayerSettings.productName = NAME_AR;
         PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, true);
         PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel29;
 
@@ -165,6 +170,29 @@ public static class QuestSetup
         Debug.Log($"[QuestSetup] Result: {report.summary.result}, " +
                   $"size: {report.summary.totalSize / (1024 * 1024)} MB, " +
                   $"errors: {report.summary.totalErrors}");
+
+        if (Application.isBatchMode &&
+            report.summary.result != UnityEditor.Build.Reporting.BuildResult.Succeeded)
+            EditorApplication.Exit(1);
+    }
+
+    [MenuItem("ConceptMapAR/Build Phone APK (Kit Build AR)")]
+    public static void BuildPhone()
+    {
+        UsePhone();
+
+        var scenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
+        if (scenes.Length == 0) scenes = new[] { "Assets/Scenes/Main.unity" };
+
+        var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+        {
+            scenes           = scenes,
+            locationPathName = PHONE_APK,
+            target           = BuildTarget.Android,
+            options          = BuildOptions.None,
+        });
+        Debug.Log($"[QuestSetup] Phone result: {report.summary.result}, " +
+                  $"size: {report.summary.totalSize / (1024 * 1024)} MB, errors: {report.summary.totalErrors}");
 
         if (Application.isBatchMode &&
             report.summary.result != UnityEditor.Build.Reporting.BuildResult.Succeeded)
