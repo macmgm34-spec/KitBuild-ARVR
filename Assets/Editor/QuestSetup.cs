@@ -17,11 +17,17 @@ public static class QuestSetup
 {
     const string OPENXR_LOADER = "UnityEngine.XR.OpenXR.OpenXRLoader";
     const string ARCORE_LOADER = "UnityEngine.XR.ARCore.ARCoreLoader";
+    const string XRSIM_LOADER  = "UnityEngine.XR.Simulation.SimulationLoader";
+    const string ACTIVE_RUNTIME = "/usr/local/share/openxr/1/active_runtime.json";
     const string QUEST_APK     = "Builds/ConceptMapAR-Quest.apk";
+    const string PHONE_APK     = "Builds/KitBuildAR.apk";
+    const string NAME_VR       = "Kit Build VR";   // nama app di Quest
+    const string NAME_AR       = "Kit Build AR";   // nama app di HP
 
     static readonly HashSet<string> QuestFeatures = new()
     {
         "MetaQuestFeature",
+        "OpenXRCompositionLayersFeature",   // wajib: layer passthrough dibuat lewat composition layer
         "MetaQuestTouchPlusControllerProfile",
         "OculusTouchControllerProfile",
         "HandInteractionProfile",
@@ -36,7 +42,7 @@ public static class QuestSetup
     {
         EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android);
 
-        var manager = AndroidXRManager();
+        var manager = XRManager(BuildTargetGroup.Android);
         XRPackageMetadataStore.RemoveLoader(manager, ARCORE_LOADER, BuildTargetGroup.Android);
         XRPackageMetadataStore.AssignLoader(manager, OPENXR_LOADER, BuildTargetGroup.Android);
 
@@ -52,6 +58,7 @@ public static class QuestSetup
         }
         EditorUtility.SetDirty(openxr);
 
+        PlayerSettings.productName = NAME_VR;
         PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
         PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new[] { GraphicsDeviceType.Vulkan });
         PlayerSettings.SetScriptingBackend(NamedBuildTarget.Android, ScriptingImplementation.IL2CPP);
@@ -66,15 +73,74 @@ public static class QuestSetup
             Debug.LogWarning($"[QuestSetup] Fitur tidak ditemukan (cek Package Manager): {string.Join(", ", missing)}");
     }
 
+    // Fitur OpenXR untuk Play Mode di Editor (Standalone). MetaQuestFeature khusus Android.
+    static readonly HashSet<string> SimulatorFeatures = new()
+    {
+        "OpenXRCompositionLayersFeature",
+        "MetaQuestTouchPlusControllerProfile",
+        "OculusTouchControllerProfile",
+        "HandInteractionProfile",
+        "ARSessionFeature",
+        "ARCameraFeature",
+        "ARPlaneFeature",
+        "ARRaycastFeature",
+    };
+
+    /// Play Mode di Editor memakai OpenXR → jalan di Meta XR Simulator
+    /// (aktifkan dulu lewat slider di app Meta XR Simulator).
+    [MenuItem("ConceptMapAR/Play Mode: Meta XR Simulator (OpenXR)")]
+    public static void UseMetaXRSimulator()
+    {
+        var manager = XRManager(BuildTargetGroup.Standalone);
+        XRPackageMetadataStore.RemoveLoader(manager, XRSIM_LOADER, BuildTargetGroup.Standalone);
+        XRPackageMetadataStore.AssignLoader(manager, OPENXR_LOADER, BuildTargetGroup.Standalone);
+
+        FeatureHelpers.RefreshFeatures(BuildTargetGroup.Standalone);
+        var openxr = OpenXRSettings.GetSettingsForBuildTargetGroup(BuildTargetGroup.Standalone);
+        var enabled = new List<string>();
+        foreach (var feature in openxr.GetFeatures())
+        {
+            if (!SimulatorFeatures.Contains(feature.GetType().Name)) continue;
+            feature.enabled = true;
+            EditorUtility.SetDirty(feature);
+            enabled.Add(feature.GetType().Name);
+        }
+        EditorUtility.SetDirty(openxr);
+        AssetDatabase.SaveAssets();
+
+        Debug.Log($"[QuestSetup] Play Mode → OpenXR (Meta XR Simulator). Fitur: {string.Join(", ", enabled)}");
+        var missing = SimulatorFeatures.Except(enabled).ToList();
+        if (missing.Count > 0)
+            Debug.LogWarning($"[QuestSetup] Fitur tidak ditemukan untuk Standalone: {string.Join(", ", missing)}");
+
+        if (!File.Exists(ACTIVE_RUNTIME))
+            Debug.LogWarning("[QuestSetup] Belum ada OpenXR runtime aktif. Buka app Meta XR Simulator " +
+                             "dan nyalakan slider di kiri atas, lalu tekan Play.");
+        else if (!File.ReadAllText(ACTIVE_RUNTIME).Contains("SIMULATOR", System.StringComparison.OrdinalIgnoreCase))
+            Debug.LogWarning($"[QuestSetup] Runtime aktif ({ACTIVE_RUNTIME}) sepertinya bukan Meta XR Simulator.");
+    }
+
+    /// Kembalikan Play Mode ke XR Simulation bawaan AR Foundation (simulasi HP)
+    [MenuItem("ConceptMapAR/Play Mode: AR Foundation XR Simulation")]
+    public static void UseARSimulation()
+    {
+        var manager = XRManager(BuildTargetGroup.Standalone);
+        XRPackageMetadataStore.RemoveLoader(manager, OPENXR_LOADER, BuildTargetGroup.Standalone);
+        XRPackageMetadataStore.AssignLoader(manager, XRSIM_LOADER, BuildTargetGroup.Standalone);
+        AssetDatabase.SaveAssets();
+        Debug.Log("[QuestSetup] Play Mode → AR Foundation XR Simulation.");
+    }
+
     [MenuItem("ConceptMapAR/Target: Android Phone (ARCore)")]
     public static void UsePhone()
     {
         EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android);
 
-        var manager = AndroidXRManager();
+        var manager = XRManager(BuildTargetGroup.Android);
         XRPackageMetadataStore.RemoveLoader(manager, OPENXR_LOADER, BuildTargetGroup.Android);
         XRPackageMetadataStore.AssignLoader(manager, ARCORE_LOADER, BuildTargetGroup.Android);
 
+        PlayerSettings.productName = NAME_AR;
         PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, true);
         PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel29;
 
@@ -110,6 +176,29 @@ public static class QuestSetup
             EditorApplication.Exit(1);
     }
 
+    [MenuItem("ConceptMapAR/Build Phone APK (Kit Build AR)")]
+    public static void BuildPhone()
+    {
+        UsePhone();
+
+        var scenes = EditorBuildSettings.scenes.Where(s => s.enabled).Select(s => s.path).ToArray();
+        if (scenes.Length == 0) scenes = new[] { "Assets/Scenes/Main.unity" };
+
+        var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+        {
+            scenes           = scenes,
+            locationPathName = PHONE_APK,
+            target           = BuildTarget.Android,
+            options          = BuildOptions.None,
+        });
+        Debug.Log($"[QuestSetup] Phone result: {report.summary.result}, " +
+                  $"size: {report.summary.totalSize / (1024 * 1024)} MB, errors: {report.summary.totalErrors}");
+
+        if (Application.isBatchMode &&
+            report.summary.result != UnityEditor.Build.Reporting.BuildResult.Succeeded)
+            EditorApplication.Exit(1);
+    }
+
     public static bool IsQuestTarget()
     {
         var general = XRGeneralSettingsPerBuildTarget.XRGeneralSettingsForBuildTarget(BuildTargetGroup.Android);
@@ -117,15 +206,15 @@ public static class QuestSetup
         return manager != null && manager.activeLoaders.Any(l => l is OpenXRLoader);
     }
 
-    static XRManagerSettings AndroidXRManager()
+    static XRManagerSettings XRManager(BuildTargetGroup group)
     {
-        var general = XRGeneralSettingsPerBuildTarget.XRGeneralSettingsForBuildTarget(BuildTargetGroup.Android);
+        var general = XRGeneralSettingsPerBuildTarget.XRGeneralSettingsForBuildTarget(group);
         if (general == null)
-            throw new BuildFailedException("XR General Settings untuk Android belum ada. Buka Project Settings > XR Plug-in Management sekali.");
+            throw new BuildFailedException($"XR General Settings untuk {group} belum ada. Buka Project Settings > XR Plug-in Management sekali.");
         if (general.AssignedSettings == null)
         {
             var manager = ScriptableObject.CreateInstance<XRManagerSettings>();
-            manager.name = "Android Providers";
+            manager.name = $"{group} Providers";
             AssetDatabase.AddObjectToAsset(manager, general);
             general.AssignedSettings = manager;
             EditorUtility.SetDirty(general);
@@ -154,6 +243,9 @@ class QuestManifestPostprocessor : IPostGenerateGradleAndroidProject
         AddElement(doc, root, "uses-permission", "com.oculus.permission.HAND_TRACKING", null);
         AddElement(doc, root, "uses-permission", "com.oculus.permission.USE_SCENE", null);
         AddElement(doc, root, "uses-feature", "oculus.software.handtracking", "false");
+        // Scan QR soal: kamera passthrough (Horizon OS v74+) + keyboard sistem untuk "Ketik Link"
+        AddElement(doc, root, "uses-permission", "horizonos.permission.HEADSET_CAMERA", null);
+        AddElement(doc, root, "uses-feature", "oculus.software.overlay_keyboard", "false");
 
         doc.Save(manifestPath);
     }

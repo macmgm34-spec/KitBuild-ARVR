@@ -3,10 +3,12 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.UI;
+using UnityEngine.InputSystem.Utilities;
 using UnityEngine.UI;
 using UnityEngine.XR;
 using UnityEngine.XR.ARFoundation;
 using TouchPhase = UnityEngine.TouchPhase;
+using XRController = UnityEngine.InputSystem.XR.XRController;
 
 public class XRSupport : MonoBehaviour
 {
@@ -41,10 +43,24 @@ public class XRSupport : MonoBehaviour
         public int          id;
         public InputAction  position, rotation, select;
         public LineRenderer line;
-        public Transform    cursor;
+        public Transform    cursor;           // ikon tangan di ujung ray
+        public MeshRenderer cursorRenderer;
+        public MaterialPropertyBlock cursorBlock;
+        public HandCursor.Pose cursorPose = (HandCursor.Pose)(-1);
+        public bool         grabbing;         // tekan dimulai di atas node/handle
         public bool         tracked;
         public Ray          ray;
+        public InternedString usage;          // LeftHand / RightHand
+        public XRController controller;       // null saat memakai hand tracking
+        public Transform    model;            // model controller sederhana
+        public Renderer     triggerRend;
     }
+
+    static readonly Color MODEL_BODY    = new Color(0.16f, 0.16f, 0.18f, 1f);
+    static readonly Color MODEL_FACE    = new Color(0.24f, 0.24f, 0.27f, 1f);
+    static readonly Color MODEL_BUTTON  = new Color(0.55f, 0.55f, 0.6f, 1f);
+    static readonly Color TRIGGER_IDLE  = new Color(0.35f, 0.35f, 0.4f, 1f);
+    static readonly Color TRIGGER_PRESS = new Color(0.36f, 0.75f, 0.92f, 1f);   // #5BC0EB
 
     bool        running;
     Camera      cam;
@@ -61,6 +77,14 @@ public class XRSupport : MonoBehaviour
     public float ScaleAxis => scaleAction != null ? scaleAction.ReadValue<Vector2>().y : 0f;
 
     public bool HeadTracked => cam != null && cam.transform.localPosition.sqrMagnitude > 0f;
+
+    /// Latar polos saat passthrough mati (default saat mengerjakan peta)
+    static readonly Color XR_BACKGROUND = Color.black;
+
+    /// Passthrough (dunia nyata) hanya dinyalakan saat perlu, mis. scan QR soal.
+    /// Di Quest passthrough mengikuti ARCameraManager.enabled; latar kamera harus
+    /// transparan saat ON dan polos saat OFF.
+    public bool Passthrough { get; set; }
 
     bool EnsureRunning()
     {
@@ -91,17 +115,52 @@ public class XRSupport : MonoBehaviour
     void Update()
     {
         if (!EnsureRunning()) return;
-        if (cam == null) { cam = Camera.main; ConfigureCamera(); }
+        if (cam == null) cam = Camera.main;
+        ConfigureCamera();   // tiap frame: latar & passthrough mengikuti state Passthrough
 
         ScanCanvases();
         if (recenterAction.WasPressedThisFrame()) panelPlaced = false;
+        UpdateCenterCombo();
         FollowHead();
+    }
+
+    // ── Combo "Pusat": peta + menu pindah ke depan wajah ──────────
+    // Kedua grip controller ditahan, ATAU trigger/pinch kedua tangan di ruang kosong ditahan.
+    const float COMBO_HOLD = 0.6f;
+    float comboTimer;
+    bool  comboFired;
+
+    void UpdateCenterCombo()
+    {
+        if (hands == null) return;
+        bool bothSelect = hands[0].select.IsPressed() && hands[1].select.IsPressed()
+                       && !hands[0].grabbing && !hands[1].grabbing;
+        bool bothGrip   = GripPressed(hands[0]) && GripPressed(hands[1]);
+
+        if (!bothSelect && !bothGrip) { comboTimer = 0f; comboFired = false; return; }
+
+        comboTimer += Time.unscaledDeltaTime;
+        if (comboFired || comboTimer < COMBO_HOLD) return;
+        comboFired = true;
+
+        var manager = FindFirstObjectByType<ConceptMapManager>();
+        if (manager != null) manager.CenterNodes();
+        panelPlaced = false;
+        var toolbar = FindFirstObjectByType<AppToolbar>();
+        if (toolbar != null) toolbar.ShowToast("Peta dipindah ke depan", 1.5f);
+    }
+
+    static bool GripPressed(Hand h)
+    {
+        if (h.controller == null) return false;
+        var grip = h.controller.TryGetChildControl<UnityEngine.InputSystem.Controls.ButtonControl>("gripPressed");
+        return grip != null && grip.isPressed;
     }
 
     void LateUpdate()
     {
         if (!running) return;
-        foreach (var h in hands) UpdateRayVisual(h);
+        foreach (var h in hands) { UpdateController(h); UpdateRayVisual(h); }
     }
 
     void OnDestroy()
@@ -115,10 +174,16 @@ public class XRSupport : MonoBehaviour
     void ConfigureCamera()
     {
         if (cam == null) return;
+
+        var manager = cam.GetComponent<ARCameraManager>();
+        if (manager != null && manager.enabled != Passthrough) manager.enabled = Passthrough;
+
+        Color target = Passthrough ? new Color(0f, 0f, 0f, 0f) : XR_BACKGROUND;
+        if (cam.clearFlags == CameraClearFlags.SolidColor && cam.backgroundColor == target) return;
         var bg = cam.GetComponent<ARCameraBackground>();
         if (bg != null) bg.enabled = false;
         cam.clearFlags      = CameraClearFlags.SolidColor;
-        cam.backgroundColor = new Color(0f, 0f, 0f, 0f);
+        cam.backgroundColor = target;
         cam.nearClipPlane   = 0.05f;
     }
 
@@ -138,7 +203,7 @@ public class XRSupport : MonoBehaviour
 
     Hand MakeHand(int id, string side)
     {
-        var h = new Hand { id = id };
+        var h = new Hand { id = id, usage = new InternedString(side) };
 
         h.position = new InputAction($"{side}Position", InputActionType.Value, expectedControlType: "Vector3");
         h.position.AddBinding($"<XRController>{{{side}}}/pointerPosition");
@@ -166,15 +231,18 @@ public class XRSupport : MonoBehaviour
         h.line.endColor       = new Color(1f, 1f, 1f, 0.15f);
         h.line.enabled        = false;
 
-        var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        Destroy(dot.GetComponent<Collider>());
-        dot.name = $"{side}Cursor";
-        dot.transform.SetParent(transform, false);
-        dot.transform.localScale = Vector3.one * 0.012f;
-        dot.GetComponent<MeshRenderer>().material = h.line.material;
-        dot.SetActive(false);
-        h.cursor = dot.transform;
+        // Sama seperti handle relasi: quad + Sprites/Default, tekstur lewat property block
+        var cursor = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        Destroy(cursor.GetComponent<Collider>());
+        cursor.name = $"{side}Cursor";
+        DontDestroyOnLoad(cursor);
+        h.cursorRenderer = cursor.GetComponent<MeshRenderer>();
+        h.cursorRenderer.material = new Material(Shader.Find("Sprites/Default"));
+        h.cursorBlock = new MaterialPropertyBlock();
+        cursor.SetActive(false);
+        h.cursor = cursor.transform;
 
+        BuildControllerModel(h, side);
         return h;
     }
 
@@ -220,14 +288,92 @@ public class XRSupport : MonoBehaviour
         }
     }
 
-    static PointerSample Sample(Hand h, TouchPhase phase, bool overUI) => new PointerSample
+    PointerSample Sample(Hand h, TouchPhase phase, bool overUI) => new PointerSample
     {
-        id     = h.id,
-        phase  = phase,
-        ray    = h.ray,
-        xr     = true,
-        overUI = overUI,
+        id        = h.id,
+        phase     = phase,
+        ray       = h.ray,
+        xr        = true,
+        overUI    = overUI,
+        depthAxis = ThumbstickY(h),
+        reach     = cam != null ? Vector3.Distance(cam.transform.position, h.ray.origin) : 0f,
     };
+
+    static float ThumbstickY(Hand h)
+    {
+        if (h.controller == null) return 0f;
+        var stick = h.controller.TryGetChildControl<UnityEngine.InputSystem.Controls.Vector2Control>("thumbstick");
+        return stick != null ? stick.ReadValue().y : 0f;
+    }
+
+    // ── Model controller ──────────────────────────
+    // Cari controller fisik (bukan device hand-interaction) yang sedang ter-track
+    void UpdateController(Hand h)
+    {
+        h.controller = null;
+        foreach (var d in InputSystem.devices)
+        {
+            if (d is not XRController xc || !d.usages.Contains(h.usage)) continue;
+            if (d.layout.IndexOf("Hand", System.StringComparison.OrdinalIgnoreCase) >= 0) continue;
+            if (!xc.isTracked.isPressed) continue;
+            h.controller = xc;
+            break;
+        }
+
+        bool show = h.controller != null;
+        if (h.model.gameObject.activeSelf != show) h.model.gameObject.SetActive(show);
+        if (!show) return;
+
+        Vector3    pos = h.controller.devicePosition.ReadValue();
+        Quaternion rot = h.controller.deviceRotation.ReadValue();
+        if (trackingOrigin != null)
+        {
+            pos = trackingOrigin.TransformPoint(pos);
+            rot = trackingOrigin.rotation * rot;
+        }
+        h.model.SetPositionAndRotation(pos, rot);
+
+        var trigger = h.controller.TryGetChildControl<UnityEngine.InputSystem.Controls.ButtonControl>("triggerPressed");
+        h.triggerRend.material.color = trigger != null && trigger.isPressed ? TRIGGER_PRESS : TRIGGER_IDLE;
+    }
+
+    // Bentuk kasar Touch Plus di grip pose: badan memanjang ke depan (+Z),
+    // muka atas dengan thumbstick & 2 tombol, trigger di bawah depan.
+    void BuildControllerModel(Hand h, string side)
+    {
+        var root = new GameObject($"{side}Controller").transform;
+        root.SetParent(transform, false);
+        h.model = root;
+
+        Part(root, PrimitiveType.Capsule,  new Vector3(0f, -0.005f, -0.01f), new Vector3(90f, 0f, 0f),
+             new Vector3(0.034f, 0.055f, 0.034f), MODEL_BODY);
+        Part(root, PrimitiveType.Cylinder, new Vector3(0f, 0.012f, 0.04f), new Vector3(-20f, 0f, 0f),
+             new Vector3(0.05f, 0.006f, 0.05f), MODEL_FACE);
+        float sx = side == "LeftHand" ? 0.008f : -0.008f;
+        Part(root, PrimitiveType.Cylinder, new Vector3(sx, 0.022f, 0.042f), new Vector3(-20f, 0f, 0f),
+             new Vector3(0.014f, 0.006f, 0.014f), MODEL_BUTTON);
+        Part(root, PrimitiveType.Sphere,   new Vector3(-sx * 1.4f, 0.017f, 0.052f), Vector3.zero,
+             Vector3.one * 0.008f, MODEL_BUTTON);
+        Part(root, PrimitiveType.Sphere,   new Vector3(-sx * 1.4f, 0.019f, 0.036f), Vector3.zero,
+             Vector3.one * 0.008f, MODEL_BUTTON);
+        h.triggerRend = Part(root, PrimitiveType.Cube, new Vector3(0f, -0.022f, 0.045f), new Vector3(25f, 0f, 0f),
+             new Vector3(0.014f, 0.012f, 0.022f), TRIGGER_IDLE);
+
+        root.gameObject.SetActive(false);
+    }
+
+    static Renderer Part(Transform parent, PrimitiveType type, Vector3 pos, Vector3 euler, Vector3 scale, Color color)
+    {
+        var go = GameObject.CreatePrimitive(type);
+        Destroy(go.GetComponent<Collider>());   // jangan ikut kena raycast node
+        go.transform.SetParent(parent, false);
+        go.transform.localPosition = pos;
+        go.transform.localEulerAngles = euler;
+        go.transform.localScale = scale;
+        var r = go.GetComponent<Renderer>();
+        r.material = new Material(Shader.Find("Sprites/Default")) { color = color };
+        return r;
+    }
 
     bool IsOverUI(Ray ray)
     {
@@ -266,18 +412,61 @@ public class XRSupport : MonoBehaviour
             return;
         }
 
-        float length = RAY_LENGTH;
-        bool  hit    = false;
-        if (Physics.Raycast(h.ray, out RaycastHit physHit, RAY_LENGTH)) { length = physHit.distance; hit = true; }
-        if (RaycastUI(h.ray, out float uiDist) && uiDist < length)     { length = uiDist;           hit = true; }
+        float   length = RAY_LENGTH;
+        bool    hit    = false;
+        MapNode node   = null;   // node yang ditunjuk
+        bool    onBody = false;  // kena badan kotak (bukan handle/tombol)
+        if (Physics.Raycast(h.ray, out RaycastHit physHit, RAY_LENGTH))
+        {
+            length = physHit.distance; hit = true;
+            node   = physHit.transform.GetComponentInParent<MapNode>();
+            onBody = node != null && physHit.transform == node.transform;
+        }
+        if (RaycastUI(h.ray, out float uiDist) && uiDist < length) { length = uiDist; hit = true; node = null; onBody = false; }
 
         Vector3 end = h.ray.GetPoint(length);
         h.line.enabled = true;
         h.line.SetPosition(0, h.ray.origin);
         h.line.SetPosition(1, end);
-        h.cursor.gameObject.SetActive(hit);
-        h.cursor.position = end;
+
+        // Pose kursor: genggam saat memegang node/handle, terbuka di atas node, selain itu menunjuk
+        if (h.select.WasPressedThisFrame()) h.grabbing = node != null;
+        if (!h.select.IsPressed())          h.grabbing = false;
+        var pose = h.grabbing ? HandCursor.Pose.Grab : onBody ? HandCursor.Pose.Open : HandCursor.Pose.Point;
+        UpdateCursor(h, hit ? end : h.ray.GetPoint(CURSOR_IDLE_DIST), pose);
     }
+
+    const float CURSOR_IDLE_DIST = 1.2f;   // posisi kursor saat ray tidak mengenai apa pun
+    const float CURSOR_ANGLE     = 0.05f;  // ukuran ≈ 2,9° pandangan, berapa pun jaraknya
+
+    void UpdateCursor(Hand h, Vector3 point, HandCursor.Pose pose)
+    {
+        if (cam == null) return;
+        if (h.cursorPose != pose)
+        {
+            h.cursorPose = pose;
+            h.cursorRenderer.GetPropertyBlock(h.cursorBlock);
+            h.cursorBlock.SetTexture("_MainTex", HandCursor.Get(pose));
+            h.cursorBlock.SetColor("_Color", Color.white);
+            h.cursorRenderer.SetPropertyBlock(h.cursorBlock);
+        }
+
+        Transform head = cam.transform;
+        float   dist = Vector3.Distance(head.position, point);
+        float   size = Mathf.Max(0.02f, dist * CURSOR_ANGLE);
+        Vector3 toCam = (head.position - point).normalized;
+        Quaternion rot = Quaternion.LookRotation(-toCam, head.up);
+
+        // Geser quad supaya titik tunjuk ikon (ujung telunjuk) tepat di titik yang ditunjuk
+        Vector2 hs = HandCursor.Hotspot(pose) - new Vector2(0.5f, 0.5f);
+        Vector3 offset = rot * new Vector3(-hs.x * size, -hs.y * size, 0f);
+
+        h.cursor.gameObject.SetActive(true);
+        h.cursor.SetPositionAndRotation(point + offset + toCam * 0.03f, rot);
+        h.cursor.localScale = new Vector3(size, size, 1f);
+
+    }
+
 
     void ConfigureUIModule()
     {

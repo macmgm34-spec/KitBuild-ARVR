@@ -10,14 +10,19 @@ public struct PointerSample
     public Vector2    screenPos;
     public bool       xr;
     public bool       overUI;
+    public float      depthAxis;   // XR: thumbstick Y controller yang memegang (+ = menjauh)
+    public float      reach;       // XR: jarak kepala → tangan/controller (untuk dorong/tarik)
 }
 
 public static class PointerInput
 {
     public const int MOUSE_ID = -99;
 
-    const float TOUCH_DRAG_PX  = 15f;
-    const float XR_DRAG_METERS = 0.015f;
+    const float TOUCH_DRAG_PX    = 15f;
+    // Ray tangan/controller goyang saat pinch/trigger ditekan → ambang harus
+    // cukup longgar supaya tap (dan double-tap) tidak terbaca sebagai drag.
+    const float XR_DRAG_DEGREES  = 2.5f;
+    const float XR_DRAG_METERS   = 0.04f;
 
     static readonly List<PointerSample> samples = new();
     static int cachedFrame = -1;
@@ -33,7 +38,8 @@ public static class PointerInput
 
     public static bool BeyondDragThreshold(in PointerSample begin, in PointerSample now) =>
         now.xr
-            ? Vector3.Distance(begin.ray.GetPoint(1f), now.ray.GetPoint(1f)) > XR_DRAG_METERS
+            ? Vector3.Angle(begin.ray.direction, now.ray.direction) > XR_DRAG_DEGREES
+              || Vector3.Distance(begin.ray.origin, now.ray.origin) > XR_DRAG_METERS
             : Vector2.Distance(begin.screenPos, now.screenPos) > TOUCH_DRAG_PX;
 
     static void Refresh()

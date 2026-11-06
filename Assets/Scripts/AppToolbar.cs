@@ -26,6 +26,10 @@ public class AppToolbar : MonoBehaviour
     private GameObject loadPanel;
     private Transform  fileListContent;
 
+    // Scan QR / ketik link soal
+    private QrScanner           qrScanner;
+    private TouchScreenKeyboard linkKeyboard;
+
     // Toast notification
     private GameObject      toastGO;
     private TextMeshProUGUI toastTxt;
@@ -36,6 +40,7 @@ public class AppToolbar : MonoBehaviour
     void Start()
     {
         mapManager = FindFirstObjectByType<ConceptMapManager>();
+        qrScanner  = gameObject.AddComponent<QrScanner>();
         BuildToolbar();
 
         // Receiver hasil file picker native (UnitySendMessage target)
@@ -45,6 +50,8 @@ public class AppToolbar : MonoBehaviour
 
     void Update()
     {
+        PollLinkKeyboard();
+
         if (toastTimer > 0f)
         {
             toastTimer -= Time.deltaTime;
@@ -58,7 +65,7 @@ public class AppToolbar : MonoBehaviour
     public void HandlePickError(string msg)
     {
         if (msg == "dibatalkan") return; // user menutup picker, bukan error
-        ShowToast($"❌ {msg}", 3.5f);
+        ShowToast($"{msg}", 3.5f);
     }
 
     // ─────────────────────────────────────────────
@@ -108,6 +115,7 @@ public class AppToolbar : MonoBehaviour
             ("Redo",   new Color(0.55f, 0.42f, 0.18f), OnRedo,       ToolbarIcons.Redo()),
             ("Rapi",   new Color(0.15f, 0.55f, 0.6f),  OnAutoLayout, ToolbarIcons.Grid()),
             ("Pusat",  new Color(0.25f, 0.45f, 0.7f),  OnCenter,     ToolbarIcons.Center()),
+            ("Periksa", new Color(0.23f, 0.72f, 0.58f), OnAssess,    ToolbarIcons.Check()),
             ("Simpan", new Color(0.2f,  0.6f,  0.3f),  OnSave,       ToolbarIcons.Save()),
             ("JSON",   new Color(0.2f,  0.4f,  0.8f),  OnViewJson,   ToolbarIcons.Json()),
         };
@@ -146,7 +154,7 @@ public class AppToolbar : MonoBehaviour
         try { Newtonsoft.Json.Linq.JToken.Parse(json); }
         catch (Exception e)
         {
-            ShowToast($"❌ JSON tidak valid: {e.Message}", 4f);
+            ShowToast($"JSON tidak valid: {e.Message}", 4f);
             return;
         }
 
@@ -169,19 +177,30 @@ public class AppToolbar : MonoBehaviour
         MakeLabel(loadPanel.transform, "Muat Peta Konsep", 16, Color.white,
             new Vector2(0, 0.9f), new Vector2(1, 1));
 
+        // Scan QR berisi link soal (JSON) dari layar HP — kamera passthrough Quest
+        MakeOverlayBtn(loadPanel.transform, "Scan QR Soal (tap lagi untuk batal)",
+            new Color(0.15f, 0.6f, 0.35f),
+            new Vector2(0.05f, 0.80f), new Vector2(0.95f, 0.89f),
+            OnScanQr);
+
+        MakeOverlayBtn(loadPanel.transform, "Ketik Link",
+            new Color(0.35f, 0.35f, 0.75f),
+            new Vector2(0.05f, 0.70f), new Vector2(0.5f, 0.79f),
+            OnTypeLink);
+
         // Pilih file lewat file manager sistem (SAF — tanpa permission)
         MakeOverlayBtn(loadPanel.transform, "Pilih File",
             new Color(0.2f, 0.5f, 0.8f),
-            new Vector2(0.05f, 0.78f), new Vector2(0.95f, 0.89f),
+            new Vector2(0.5f, 0.70f), new Vector2(0.95f, 0.79f),
             OnPickFile);
 
         MakeOverlayBtn(loadPanel.transform, "Dari Clipboard (JSON / URL)",
             new Color(0.8f, 0.5f, 0.15f),
-            new Vector2(0.05f, 0.66f), new Vector2(0.95f, 0.77f),
+            new Vector2(0.05f, 0.60f), new Vector2(0.95f, 0.69f),
             OnLoadFromClipboard);
 
         MakeLabel(loadPanel.transform, "Atau tap file di bawah:", 10, new Color(0.8f, 0.8f, 0.8f),
-            new Vector2(0.03f, 0.6f), new Vector2(0.97f, 0.66f));
+            new Vector2(0.03f, 0.54f), new Vector2(0.97f, 0.60f));
 
         // Scroll daftar file
         var scrollGO = new GameObject("FileScroll");
@@ -189,7 +208,7 @@ public class AppToolbar : MonoBehaviour
         var scroll   = scrollGO.AddComponent<ScrollRect>();
         var scrollRT = scrollGO.GetComponent<RectTransform>();
         scrollRT.anchorMin = new Vector2(0.03f, 0.12f);
-        scrollRT.anchorMax = new Vector2(0.97f, 0.59f);
+        scrollRT.anchorMax = new Vector2(0.97f, 0.53f);
         scrollRT.offsetMin = Vector2.zero; scrollRT.offsetMax = Vector2.zero;
         scrollGO.AddComponent<RectMask2D>();
 
@@ -276,7 +295,7 @@ public class AppToolbar : MonoBehaviour
         try { LoadJson(File.ReadAllText(path)); }
         catch (Exception e)
         {
-            ShowToast($"❌ Gagal baca file:\n{e.Message}\nCoba lewat clipboard.", 4f);
+            ShowToast($"Gagal baca file:\n{e.Message}\nCoba lewat clipboard.", 4f);
         }
     }
 
@@ -290,7 +309,7 @@ public class AppToolbar : MonoBehaviour
         }
         catch (Exception e)
         {
-            ShowToast($"❌ File picker gagal: {e.Message}\nPakai clipboard saja.", 4f);
+            ShowToast($"File picker gagal: {e.Message}\nPakai clipboard saja.", 4f);
         }
 #else
         ShowToast("File picker hanya di Android — pakai clipboard di Editor.", 3f);
@@ -302,7 +321,7 @@ public class AppToolbar : MonoBehaviour
         string clip = (GUIUtility.systemCopyBuffer ?? "").Trim();
         if (clip.StartsWith("http"))
         {
-            ShowToast("⏳ Mengunduh dari URL…", 2f);
+            ShowToast("Mengunduh dari URL...", 2f);
             StartCoroutine(LoadFromUrl(clip));
         }
         else if (clip.StartsWith("{"))
@@ -311,7 +330,64 @@ public class AppToolbar : MonoBehaviour
         }
         else
         {
-            ShowToast("❌ Clipboard bukan JSON atau URL.", 3.5f);
+            ShowToast("Clipboard bukan JSON atau URL.", 3.5f);
+        }
+    }
+
+    // ── Scan QR ──────────────────────────────────
+    void OnScanQr()
+    {
+        if (qrScanner.IsScanning)
+        {
+            qrScanner.Stop();
+            ShowToast("Scan dibatalkan.", 2f);
+            return;
+        }
+        loadPanel.SetActive(false);   // layar bersih selama membidik QR
+        ShowToast(PointerInput.IsXR ? "Arahkan pandangan ke kode QR..." : "Arahkan kamera ke kode QR...", 4f);
+        qrScanner.StartScan(OnQrResult, err => ShowToast($"{err}", 4f));
+    }
+
+    void OnQrResult(string text)
+    {
+        if (text.StartsWith("http"))
+        {
+            ShowToast("QR terbaca, mengunduh soal...", 3f);
+            StartCoroutine(LoadFromUrl(text));
+        }
+        else if (text.StartsWith("{"))
+            LoadJson(text);
+        else
+            ShowToast($"QR bukan link soal:\n{text}", 4f);
+    }
+
+    // ── Ketik link (keyboard sistem Quest/HP) ─────
+    void OnTypeLink()
+    {
+        linkKeyboard = TouchScreenKeyboard.Open("https://", TouchScreenKeyboardType.URL, false, false, false, false,
+                                                "Link soal (JSON)");
+        if (linkKeyboard == null) ShowToast("Keyboard tidak tersedia, pakai Clipboard.", 3.5f);
+    }
+
+    void PollLinkKeyboard()
+    {
+        if (linkKeyboard == null) return;
+        switch (linkKeyboard.status)
+        {
+            case TouchScreenKeyboard.Status.Done:
+                string url = (linkKeyboard.text ?? "").Trim();
+                linkKeyboard = null;
+                if (url.StartsWith("http") && url.Length > 8)
+                {
+                    ShowToast("Mengunduh dari URL...", 2f);
+                    StartCoroutine(LoadFromUrl(url));
+                }
+                else ShowToast("Link tidak valid.", 3f);
+                break;
+            case TouchScreenKeyboard.Status.Canceled:
+            case TouchScreenKeyboard.Status.LostFocus:
+                linkKeyboard = null;
+                break;
         }
     }
 
@@ -324,7 +400,7 @@ public class AppToolbar : MonoBehaviour
         if (req.result == UnityWebRequest.Result.Success)
             LoadJson(req.downloadHandler.text);
         else
-            ShowToast($"❌ Gagal unduh:\n{req.error}", 4f);
+            ShowToast($"Gagal unduh:\n{req.error}", 4f);
     }
 
     // ─────────────────────────────────────────────
@@ -332,7 +408,7 @@ public class AppToolbar : MonoBehaviour
     // ─────────────────────────────────────────────
     void OnSave()
     {
-        if (mapManager == null) { ShowToast("❌ MapManager tidak ditemukan"); return; }
+        if (mapManager == null) { ShowToast("MapManager tidak ditemukan"); return; }
 
         string json     = mapManager.GetCurrentJson();
         string fileName = $"concept-map-{DateTime.Now:yyyyMMdd_HHmmss}.json";
@@ -341,11 +417,11 @@ public class AppToolbar : MonoBehaviour
         {
             string saved = SaveToStorage(fileName, json);
             GUIUtility.systemCopyBuffer = json;
-            ShowToast($"✅ Tersimpan!\n{saved}", 4f);
+            ShowToast($"Tersimpan!\n{saved}", 4f);
         }
         catch (Exception e)
         {
-            ShowToast($"❌ Gagal simpan:\n{e.Message}", 4f);
+            ShowToast($"Gagal simpan:\n{e.Message}", 4f);
         }
     }
 
@@ -472,6 +548,18 @@ public class AppToolbar : MonoBehaviour
         ShowToast("Node dirapikan", 1.5f);
     }
 
+    // Penilaian otomatis terhadap kunci_jawaban soal
+    void OnAssess()
+    {
+        if (mapManager == null) return;
+        var r = mapManager.Assess();
+        if (r == null) { ShowToast("Soal ini tidak punya kunci jawaban.", 3f); return; }
+
+        int pct = Mathf.RoundToInt(r.Score * 100f);
+        string head = r.match == r.total && r.excess == 0 ? "Sempurna! " : "";
+        ShowToast($"{head}Benar {r.match} dari {r.total} ({pct}%)\nKurang {r.miss} · Lebih {r.excess}", 6f);
+    }
+
     void OnCenter()
     {
         if (mapManager == null) return;
@@ -502,7 +590,7 @@ public class AppToolbar : MonoBehaviour
         toastGO.SetActive(false);
     }
 
-    void ShowToast(string msg, float duration = 3f)
+    public void ShowToast(string msg, float duration = 3f)
     {
         toastTxt.text = msg;
         toastGO.SetActive(true);
